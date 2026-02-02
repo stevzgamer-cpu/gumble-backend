@@ -1,22 +1,38 @@
 const express = require('express');
 const connectDB = require('./connection');
+const User = require('./user'); // Match your lowercase 'user.js' file name
 require('dotenv').config();
 
 const app = express();
 
-// Middleware to parse JSON (useful for future API routes)
-app.use(express.json());
+// Middleware to parse JSON so the server can read your data
+app.use(express.json()); 
 
-// Home Route: This fixes the "Cannot GET /" error
+// Home Route
 app.get('/', (req, res) => {
   res.send('🚀 Gumble Backend is officially live and connected to the database!');
 });
 
-// Connect to MongoDB Atlas (N. Virginia Cluster)
+// NEW: Registration Route
+app.post('/register', async (req, res) => {
+  try {
+    const { username } = req.body;
+    
+    // Create a new user (balance defaults to 1000)
+    const newUser = new User({ username });
+    await newUser.save();
+    
+    res.status(201).json({ message: '✅ User created!', user: newUser });
+  } catch (err) {
+    res.status(400).json({ error: '❌ Error creating user', details: err.message });
+  }
+});
+
+// Connect to MongoDB
 connectDB();
 
-// Dynamic Port Binding: Uses Render's port (10000) or 5000 locally
-const PORT = process.env.PORT || 5000;
+// Render Port Binding
+const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);
 });
