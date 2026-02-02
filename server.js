@@ -1,43 +1,17 @@
-const express = require('express');
-const connectDB = require('./connection');
-const User = require('./user'); // Ensure this matches your lowercase filename
-const cors = require('cors'); // The bridge tool
-require('dotenv').config();
+const jwt = require('jsonwebtoken');
 
-const app = express();
-app.use(cors()); // Allows your website to talk to this server
-app.use(express.json()); // Allows server to read data
-
-// 1. Home Message
-app.get('/', (req, res) => {
-  res.send('🚀 Gumble Casino Backend is Live!');
-});
-
-// 2. The Game: Simple High/Low Bet
-app.post('/bet', async (req, res) => {
+// Middleware to protect the /bet route
+const verifyToken = (req, res, next) => {
+  const token = req.header('Authorization');
+  if (!token) return res.status(401).send('Access Denied');
   try {
-    const { username, betAmount } = req.body;
-    const user = await User.findOne({ username });
+    req.user = jwt.verify(token, process.env.JWT_SECRET);
+    next();
+  } catch (err) { res.status(400).send('Invalid Token'); }
+};
 
-    if (!user || user.balance < betAmount) {
-      return res.status(400).json({ error: 'Insufficient balance' });
-    }
-
-    const win = Math.random() > 0.5; // 50/50 chance
-    if (win) {
-      user.balance += betAmount;
-      await user.save();
-      return res.json({ message: '🎉 YOU WON!', newBalance: user.balance });
-    } else {
-      user.balance -= betAmount;
-      await user.save();
-      return res.json({ message: '❌ You lost.', newBalance: user.balance });
-    }
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+app.post('/bet', verifyToken, async (req, res) => {
+  // Only users with a valid token can reach this code
+  const user = await User.findById(req.user.userId);
+  // ... rest of game logic
 });
-
-connectDB();
-const PORT = process.env.PORT || 10000;
-app.listen(PORT, () => console.log(`🚀 Casino running on port ${PORT}`));
