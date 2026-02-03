@@ -10,8 +10,7 @@ const PORT = process.env.PORT || 10000;
 
 // MongoDB Connection with your new password
 // Replace 'stevzgamer-cpu' with your actual MongoDB username if different
-const mongoURI = "mongodb+srv://stevzgamer-cpu:GumbleDB206@cluster0.mongodb.net/GumbleDB?retryWrites=true&w=majority";
-
+const mongoURI = "mongodb+srv://stevzgamer-db-user:GumbleDB206@cluster0.uw2p1mi.mongodb.net/GumbleDB?retryWrites=true&w=majority";
 mongoose.connect(mongoURI)
     .then(() => console.log("🚀 Success: Connected to GumbleDB!"))
     .catch(err => console.error("❌ MongoDB Connection Error: ", err));
