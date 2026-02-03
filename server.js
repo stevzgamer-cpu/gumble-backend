@@ -4,7 +4,7 @@ const http = require('http');
 const mongoose = require('mongoose');
 const cors = require('cors');
 const { Server } = require('socket.io');
-const { Hand } = require('pokersolver'); // Requires: npm install pokersolver
+const { Hand } = require('pokersolver'); 
 const User = require('./models/User');
 
 const app = express();
@@ -49,17 +49,9 @@ const io = new Server(server, { cors: { origin: "*" } });
 
 let gameState = {
   roomId: "HighRollers",
-  players: [], 
-  communityCards: [],
-  pot: 0,
-  deck: [],
-  phase: 'waiting', 
-  turnIndex: 0,
-  dealerIndex: 0,
-  highestBet: 0,
-  timer: 30
+  players: [], communityCards: [], pot: 0, deck: [],
+  phase: 'waiting', turnIndex: 0, dealerIndex: 0, highestBet: 0, timer: 30, winners: []
 };
-
 let turnTimeout;
 
 const createDeck = () => {
@@ -70,45 +62,9 @@ const createDeck = () => {
   return deck.sort(() => Math.random() - 0.5);
 };
 
-const startTurnTimer = () => {
-    clearInterval(turnTimeout);
-    gameState.timer = 30;
-    turnTimeout = setInterval(() => {
-        gameState.timer--;
-        if (gameState.timer <= 0) {
-            clearInterval(turnTimeout);
-            // Auto-Fold on timeout
-            const p = gameState.players[gameState.turnIndex];
-            if(p) handleAction(p.id, 'fold', 0);
-        }
-        io.emit('gameState', gameState);
-    }, 1000);
-};
-
-const checkRoundComplete = () => {
-    const activePlayers = gameState.players.filter(p => !p.folded);
-    
-    // 1. If only one player left, they win immediately
-    if (activePlayers.length === 1) { endHand(activePlayers[0]); return; }
-
-    // 2. Check if everyone has acted and matched the bet
-    const allMatched = activePlayers.every(p => p.currentBet === gameState.highestBet && p.actedThisRound);
-    
-    if (allMatched) {
-        nextStage();
-    } else {
-        nextTurn();
-    }
-};
-
 const nextStage = () => {
     clearInterval(turnTimeout);
-    
-    // Move bets to pot and reset player round stats
-    gameState.players.forEach(p => {
-        p.currentBet = 0;
-        p.actedThisRound = false; 
-    });
+    gameState.players.forEach(p => { p.currentBet = 0; });
     gameState.highestBet = 0;
 
     if (gameState.phase === 'preflop') {
@@ -121,113 +77,146 @@ const nextStage = () => {
         gameState.phase = 'river';
         gameState.communityCards.push(gameState.deck.pop());
     } else {
-        determineWinner(); return; 
+        solveHand(); return;
     }
     
-    // Reset turn to first active player left of dealer
-    gameState.turnIndex = gameState.dealerIndex;
-    rotateTurnToActive();
-    
+    rotateTurn();
     io.emit('gameState', gameState);
     startTurnTimer();
 };
 
-const rotateTurnToActive = () => {
+const rotateTurn = () => {
+    let attempts = 0;
     do {
         gameState.turnIndex = (gameState.turnIndex + 1) % gameState.players.length;
-    } while (gameState.players[gameState.turnIndex].folded);
+        attempts++;
+    } while (gameState.players[gameState.turnIndex].folded && attempts < gameState.players.length);
 };
 
-const nextTurn = () => {
-    rotateTurnToActive();
-    io.emit('gameState', gameState);
-    startTurnTimer();
+const startTurnTimer = () => {
+    clearInterval(turnTimeout);
+    gameState.timer = 30;
+    turnTimeout = setInterval(() => {
+        gameState.timer--;
+        if (gameState.timer <= 0) {
+            clearInterval(turnTimeout);
+            const p = gameState.players[gameState.turnIndex];
+            if(p) handleAction(p.id, 'fold', 0);
+        }
+        io.emit('gameState', gameState);
+    }, 1000);
 };
 
 const handleAction = (socketId, type, amount) => {
     const player = gameState.players.find(p => p.id === socketId);
     if (!player || gameState.players[gameState.turnIndex].id !== socketId) return;
 
-    player.actedThisRound = true;
-
-    if (type === 'fold') {
-        player.folded = true;
-    } else if (type === 'call') {
+    if (type === 'fold') player.folded = true;
+    else if (type === 'call') {
         const toCall = gameState.highestBet - player.currentBet;
-        if (player.balance >= toCall) {
-            player.balance -= toCall;
-            player.currentBet += toCall;
-            gameState.pot += toCall;
-        } else {
-            // All-in logic simplified
-            player.currentBet += player.balance;
-            gameState.pot += player.balance;
-            player.balance = 0;
-        }
+        player.balance -= toCall;
+        player.currentBet += toCall;
+        gameState.pot += toCall;
     } else if (type === 'raise') {
-        const totalBet = Number(amount);
-        const added = totalBet - player.currentBet;
-        if (player.balance >= added && totalBet > gameState.highestBet) {
-            player.balance -= added;
-            player.currentBet = totalBet;
-            gameState.pot += added;
-            gameState.highestBet = totalBet;
-            // Re-open action for others
-            gameState.players.forEach(p => { if(p.id !== player.id && !p.folded) p.actedThisRound = false; });
-        }
+        const total = Number(amount);
+        const diff = total - player.currentBet;
+        player.balance -= diff;
+        player.currentBet = total;
+        gameState.pot += diff;
+        gameState.highestBet = total;
     }
 
-    checkRoundComplete();
+    const active = gameState.players.filter(p => !p.folded);
+    const allMatched = active.every(p => p.currentBet === gameState.highestBet);
+    
+    if (allMatched && active.length > 1) nextStage();
+    else {
+        rotateTurn();
+        io.emit('gameState', gameState);
+        startTurnTimer();
+    }
 };
 
-const determineWinner = async () => {
+const solveHand = async () => {
     gameState.phase = 'showdown';
-    io.emit('gameState', gameState);
-
-    const activePlayers = gameState.players.filter(p => !p.folded);
-    
-    // Solver needs format like 'Ad', 'Ks' (T -> 10 converted automatically by some, but let's be safe)
-    const solvedHands = activePlayers.map(p => {
-        const cards = [...p.hand, ...gameState.communityCards].map(c => c.replace('0', 'T'));
-        const solved = Hand.solve(cards);
-        solved.owner = p.dbId;
-        return solved;
+    const playersForSolver = gameState.players.filter(p => !p.folded).map(p => {
+        const sevenCards = [...p.hand, ...gameState.communityCards].map(c => c.replace('0', 'T'));
+        const hand = Hand.solve(sevenCards);
+        hand.ownerId = p.dbId;
+        hand.originalName = p.name;
+        return hand;
     });
 
-    const winners = Hand.winners(solvedHands);
-    const winnerId = winners[0].owner;
-    const winnerPlayer = gameState.players.find(p => p.dbId === winnerId);
+    const winners = Hand.winners(playersForSolver);
+    const payout = Math.floor(gameState.pot / winners.length);
+    gameState.winners = winners.map(w => w.originalName);
 
-    if (winnerPlayer) {
-        winnerPlayer.balance += gameState.pot;
-        await User.findByIdAndUpdate(winnerPlayer.dbId, { $inc: { balance: gameState.pot } });
+    for (let w of winners) {
+        const player = gameState.players.find(p => p.dbId === w.ownerId);
+        if (player) player.balance += payout;
+        await User.findByIdAndUpdate(w.ownerId, { $inc: { balance: payout } });
     }
 
-    setTimeout(startNewHand, 8000);
-};
-
-const endHand = async (winner) => {
-    clearInterval(turnTimeout);
-    gameState.phase = 'showdown';
-    winner.balance += gameState.pot;
-    await User.findByIdAndUpdate(winner.dbId, { $inc: { balance: gameState.pot } });
     io.emit('gameState', gameState);
-    setTimeout(startNewHand, 5000);
+    setTimeout(startNewHand, 8000);
 };
 
 const startNewHand = () => {
     if (gameState.players.length < 2) { 
-        gameState.phase = 'waiting'; 
-        gameState.communityCards = [];
-        gameState.pot = 0;
-        io.emit('gameState', gameState); 
-        return; 
+        gameState.phase = 'waiting'; gameState.communityCards = []; gameState.pot = 0; gameState.winners = [];
+        io.emit('gameState', gameState); return; 
     }
 
     gameState.deck = createDeck();
     gameState.communityCards = [];
     gameState.pot = 0;
     gameState.phase = 'preflop';
+    gameState.winners = [];
+    gameState.dealerIndex = (gameState.dealerIndex + 1) % gameState.players.length;
     
-    // Rotate Dealer
-    gameState.dealerIndex =
+    const sb = (gameState.dealerIndex + 1) % gameState.players.length;
+    const bb = (gameState.dealerIndex + 2) % gameState.players.length;
+
+    gameState.players.forEach((p, i) => {
+        p.hand = [gameState.deck.pop(), gameState.deck.pop()];
+        p.folded = false;
+        p.currentBet = 0;
+        if (i === sb) { p.balance -= 10; p.currentBet = 10; gameState.pot += 10; }
+        if (i === bb) { p.balance -= 20; p.currentBet = 20; gameState.pot += 20; gameState.highestBet = 20; }
+    });
+
+    gameState.turnIndex = (bb + 1) % gameState.players.length;
+    startTurnTimer();
+    io.emit('gameState', gameState);
+};
+
+io.on('connection', (socket) => {
+    socket.on('joinGame', async ({ userId, buyIn }) => {
+        const user = await User.findById(userId);
+        if (!user || user.balance < buyIn) return;
+
+        await User.findByIdAndUpdate(userId, { $inc: { balance: -buyIn } });
+        gameState.players.push({
+            id: socket.id, dbId: userId, name: user.username,
+            balance: buyIn, hand: [], currentBet: 0, folded: false
+        });
+
+        if (gameState.players.length >= 2 && gameState.phase === 'waiting') startNewHand();
+        else io.emit('gameState', gameState);
+    });
+
+    socket.on('leaveGame', async () => {
+        const idx = gameState.players.findIndex(p => p.id === socket.id);
+        if (idx !== -1) {
+            const p = gameState.players[idx];
+            await User.findByIdAndUpdate(p.dbId, { $inc: { balance: p.balance } });
+            gameState.players.splice(idx, 1);
+            if(gameState.players.length < 2) { gameState.phase = 'waiting'; clearInterval(turnTimeout); }
+            io.emit('gameState', gameState);
+        }
+    });
+
+    socket.on('action', ({ type, amount }) => handleAction(socket.id, type, amount));
+});
+
+server.listen(process.env.PORT || 10000);
