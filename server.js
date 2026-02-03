@@ -261,6 +261,13 @@ socket.on('joinTable', (userData) => {
     }
 });
 
+// Inside your joinTable logic in server.js
+if (gameState.players.length >= 2) {
+    gameState.phase = 'playing'; // Change from 'waiting'
+    startNewHand(); // This deals the cards and updates the pot
+    io.emit('gameStateUpdate', gameState);
+}
+
 server.listen(PORT, () => console.log(`🃏 Poker Server on ${PORT}`));
 
 // Game State
