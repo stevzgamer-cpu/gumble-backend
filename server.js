@@ -250,6 +250,17 @@ async function handleHandEnd(winners, potAmount) {
     console.log(`House earned ${totalRake} in commission.`);
 }
 
+// Inside your io.on('connection') block
+socket.on('joinTable', (userData) => {
+    // ... your existing join logic ...
+    
+    if (gameState.players.length >= 2 && gameState.phase === 'waiting') {
+        console.log("Starting a new perfect hand!");
+        startNewHand(); // This deals the cards
+        io.emit('gameStateUpdate', gameState);
+    }
+});
+
 server.listen(PORT, () => console.log(`🃏 Poker Server on ${PORT}`));
 
 // Game State
