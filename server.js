@@ -5,165 +5,150 @@ const http = require('http');
 const { Server } = require('socket.io');
 const { OAuth2Client } = require('google-auth-library');
 
-// --- CONFIGURATION ---
 const app = express();
 const server = http.createServer(app);
 const PORT = process.env.PORT || 5000;
 const GOOGLE_CLIENT_ID = "67123336647-b00rcsb6ni8s8unhi3qqg0bk6l2es62l.apps.googleusercontent.com";
 
-// --- MIDDLEWARE ---
-app.use(cors({
-    origin: "*", // Allows connections from any frontend (Mobile/Render/Localhost)
-    methods: ["GET", "POST"]
-}));
+app.use(cors({ origin: "*", methods: ["GET", "POST"] }));
 app.use(express.json());
 
-// --- SOCKET.IO SETUP ---
-const io = new Server(server, {
-    cors: { origin: "*", methods: ["GET", "POST"] }
-});
+const io = new Server(server, { cors: { origin: "*" } });
 
-// --- DATABASE CONNECTION (SECURE) ---
-// Uses Render's Environment Variable if available, otherwise Localhost
+// DB Connection
 const dbURI = process.env.MONGO_URI || 'mongodb://localhost:27017/gumblevip';
-
 mongoose.connect(dbURI)
-  .then(() => console.log('✅ MongoDB Connected: Ledger Active'))
-  .catch(err => console.error('❌ DB Connection Error:', err));
+  .then(() => console.log('✅ Ledger Active'))
+  .catch(err => console.error('❌ DB Error:', err));
 
-// --- DATA MODELS ---
 const UserSchema = new mongoose.Schema({
-  googleId: { type: String, required: true, unique: true },
-  name: String,
-  email: String,
-  balance: { type: Number, default: 1000.00 }, // Starting Balance
-  createdAt: { type: Date, default: Date.now }
+  googleId: String, name: String, email: String, balance: { type: Number, default: 1000.00 }
 });
 const User = mongoose.model('User', UserSchema);
 
-// --- AUTHENTICATION ROUTE ---
 const client = new OAuth2Client(GOOGLE_CLIENT_ID);
 
+// --- AUTH ---
 app.post('/api/auth/google', async (req, res) => {
   const { token } = req.body;
   try {
-    const ticket = await client.verifyIdToken({
-      idToken: token,
-      audience: GOOGLE_CLIENT_ID
-    });
+    const ticket = await client.verifyIdToken({ idToken: token, audience: GOOGLE_CLIENT_ID });
     const payload = ticket.getPayload();
-    
     let user = await User.findOne({ googleId: payload.sub });
-    
     if (!user) {
-      console.log(`🆕 New VIP Registration: ${payload.email}`);
-      user = new User({ 
-          googleId: payload.sub, 
-          name: payload.name, 
-          email: payload.email,
-          balance: 1000.00 // Welcome Bonus
-      });
+      user = new User({ googleId: payload.sub, name: payload.name, email: payload.email, balance: 1000 });
       await user.save();
-    } else {
-        console.log(`👤 VIP Login: ${payload.email}`);
     }
     res.json(user);
-  } catch (err) {
-    console.error("Auth Failed:", err);
-    res.status(401).json({ error: "Authentication failed" });
-  }
+  } catch (err) { res.status(401).json({ error: "Auth failed" }); }
 });
 
-// --- GAME LOGIC: MINES ---
+// --- HELPER: UPDATE BALANCE ---
+async function updateBalance(userId, amount, socketId) {
+    const user = await User.findById(userId);
+    user.balance += amount;
+    await user.save();
+    io.emit('balanceUpdate', { userId, balance: user.balance });
+    return user.balance;
+}
+
+// --- GAME 1: MINES ---
 app.post('/api/mines/play', async (req, res) => {
   const { userId, bet, minesCount } = req.body;
+  await updateBalance(userId, -bet);
   
-  // validation
-  if (bet <= 0) return res.status(400).json({ error: "Invalid bet" });
-
-  const user = await User.findById(userId);
-  if (!user || user.balance < bet) return res.status(400).json({ error: "Insufficient funds" });
-
-  // Deduct Bet
-  user.balance -= bet;
-  await user.save();
-  io.emit('balanceUpdate', { userId, balance: user.balance });
-
-  // Generate Grid (Server Side Only)
-  let grid = Array(25).fill(0); // 0 = safe, 1 = mine
+  let grid = Array(25).fill(0);
   let placed = 0;
   while(placed < minesCount) {
-    let idx = Math.floor(Math.random() * 25);
-    if(grid[idx] === 0) {
-      grid[idx] = 1;
-      placed++;
-    }
+    let i = Math.floor(Math.random()*25);
+    if(grid[i]===0) { grid[i]=1; placed++; }
   }
-
-  // Calculate Base Multiplier Logic
-  // Formula: 0.99 * (25 / (25 - mines))
-  const multiplierBase = 1.0 + (minesCount / 25); 
-
-  res.json({ success: true, grid, multiplierBase });
+  res.json({ grid });
 });
 
 app.post('/api/mines/cashout', async (req, res) => {
   const { userId, winAmount } = req.body;
-  const user = await User.findById(userId);
-  user.balance += winAmount;
-  await user.save();
-  
-  io.emit('balanceUpdate', { userId, balance: user.balance });
-  res.json({ success: true, newBalance: user.balance });
-});
-
-// --- GAME LOGIC: BLACKJACK ---
-// Simple stateless dealer for stability
-const ranks = ['2','3','4','5','6','7','8','9','0','J','Q','K','A'];
-const suits = ['H','D','C','S'];
-const cardValues = {'2':2,'3':3,'4':4,'5':5,'6':6,'7':7,'8':8,'9':9,'0':10,'J':10,'Q':10,'K':10,'A':11};
-
-const drawCard = () => {
-    const r = ranks[Math.floor(Math.random()*ranks.length)];
-    const s = suits[Math.floor(Math.random()*suits.length)];
-    // Using deckofcardsapi images
-    return { 
-        code: r+s, 
-        value: cardValues[r], 
-        image: `https://deckofcardsapi.com/static/img/${r}${s}.png` 
-    };
-};
-
-app.post('/api/blackjack/deal', async (req, res) => {
-  const { userId, bet } = req.body;
-  const user = await User.findById(userId);
-  
-  if (user.balance < bet) return res.status(400).json({ error: "Funds" });
-
-  user.balance -= bet;
-  await user.save();
-  io.emit('balanceUpdate', { userId, balance: user.balance });
-
-  const pHand = [drawCard(), drawCard()];
-  const dHand = [drawCard(), drawCard()];
-
-  res.json({ playerHand: pHand, dealerHand: dHand });
-});
-
-app.post('/api/blackjack/payout', async (req, res) => {
-  const { userId, bet, multiplier } = req.body;
-  const user = await User.findById(userId);
-  
-  const winAmount = bet * multiplier;
-  user.balance += winAmount;
-  await user.save();
-  
-  io.emit('balanceUpdate', { userId, balance: user.balance });
+  await updateBalance(userId, winAmount);
   res.json({ success: true });
 });
 
-// --- SERVER START ---
-server.listen(PORT, () => {
-  console.log(`🚀 GUMBLEVIP Server Live on Port ${PORT}`);
-  console.log(`🔌 Env: ${process.env.MONGO_URI ? 'Production' : 'Local Development'}`);
+// --- GAME 2: BLACKJACK ---
+// (Simplified for reliability)
+const getCard = () => {
+    const r = ['2','3','4','5','6','7','8','9','0','J','Q','K','A'][Math.floor(Math.random()*13)];
+    const s = ['H','D','C','S'][Math.floor(Math.random()*4)];
+    const v = (r==='A') ? 11 : (['J','Q','K','0'].includes(r) ? 10 : parseInt(r));
+    return { code: r+s, value: v, image: `https://deckofcardsapi.com/static/img/${r}${s}.png` };
+};
+
+app.post('/api/blackjack/deal', async (req, res) => {
+    const { userId, bet } = req.body;
+    await updateBalance(userId, -bet);
+    res.json({ playerHand: [getCard(), getCard()], dealerHand: [getCard(), getCard()] });
 });
+
+app.post('/api/blackjack/hit', async (req, res) => {
+    res.json({ card: getCard() });
+});
+
+app.post('/api/blackjack/payout', async (req, res) => {
+    const { userId, amount } = req.body;
+    await updateBalance(userId, amount);
+    res.json({ success: true });
+});
+
+// --- GAME 3: DRAGON TOWER ---
+// Logic: 9 Rows. Difficulty determines bombs per row.
+app.post('/api/dragon/play', async (req, res) => {
+    const { userId, bet, difficulty } = req.body;
+    // Easy: 1 Bomb (2 Safe), Medium: 1 Bomb (2 Safe) - Adjusted for demo
+    // Hard: 2 Bombs (1 Safe)
+    await updateBalance(userId, -bet);
+    
+    const rows = [];
+    const bombCount = difficulty === 'HARD' ? 2 : 1;
+    
+    for(let i=0; i<9; i++) {
+        let row = [0, 0, 0]; // 0=Safe, 1=Dragon
+        let bombs = 0;
+        while(bombs < bombCount) {
+            let r = Math.floor(Math.random()*3);
+            if(row[r]===0) { row[r]=1; bombs++; }
+        }
+        rows.push(row);
+    }
+    res.json({ rows });
+});
+
+app.post('/api/dragon/cashout', async (req, res) => {
+    const { userId, amount } = req.body;
+    await updateBalance(userId, amount);
+    res.json({ success: true });
+});
+
+// --- GAME 4: KENO ---
+app.post('/api/keno/play', async (req, res) => {
+    const { userId, bet, picks } = req.body;
+    await updateBalance(userId, -bet);
+
+    // Draw 10 numbers (1-40)
+    let drawn = [];
+    while(drawn.length < 10) {
+        let n = Math.floor(Math.random()*40)+1;
+        if(!drawn.includes(n)) drawn.push(n);
+    }
+    
+    // Calculate Matches
+    let matches = 0;
+    picks.forEach(p => { if(drawn.includes(p)) matches++; });
+    
+    // Payout Table
+    const multipliers = {0:0, 1:0, 2:0, 3:1.2, 4:3, 5:5, 6:10, 7:25, 8:50, 9:100, 10:500};
+    const win = bet * multipliers[matches];
+    
+    if(win > 0) await updateBalance(userId, win);
+    
+    res.json({ drawn, matches, win });
+});
+
+server.listen(PORT, () => console.log(`Engine Running on ${PORT}`));
