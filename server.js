@@ -5,30 +5,68 @@ const mongoose = require('mongoose');
 const cors = require('cors');
 const { Server } = require('socket.io');
 const { Hand } = require('pokersolver'); 
+const { OAuth2Client } = require('google-auth-library'); // NEW LIBRARY
 const User = require('./models/User');
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
+// CLIENT ID (Paste yours here or in .env)
+const GOOGLE_CLIENT_ID = "YOUR_GOOGLE_CLIENT_ID_HERE"; 
+const client = new OAuth2Client(GOOGLE_CLIENT_ID);
+
 mongoose.connect(process.env.MONGO_URI)
   .then(() => console.log("✅ MongoDB Connected"))
   .catch(err => console.error("❌ DB Error:", err));
 
-// --- AUTH & WALLET ---
-app.post('/api/register', async (req, res) => {
-  try {
-    const user = await User.create({ username: req.body.username, password: req.body.password, balance: 1000 });
-    res.json(user);
-  } catch (err) { res.status(400).json({ error: "Username taken" }); }
+// --- AUTH ROUTES ---
+
+// 1. Google Login Route
+app.post('/api/google-login', async (req, res) => {
+    const { token } = req.body;
+    try {
+        // Verify the token with Google
+        const ticket = await client.verifyIdToken({
+            idToken: token,
+            audience: GOOGLE_CLIENT_ID,
+        });
+        const { name, email, sub } = ticket.getPayload();
+
+        // Find or Create User
+        let user = await User.findOne({ email });
+        if (!user) {
+            // New Google User
+            user = await User.create({
+                username: name,
+                email: email,
+                balance: 10000, // Welcome Bonus
+                password: "" // No password for Google users
+            });
+        }
+        res.json(user);
+    } catch (error) {
+        console.error("Google Auth Error:", error);
+        res.status(400).json({ error: "Google Login Failed" });
+    }
 });
 
+// 2. Standard Login
 app.post('/api/login', async (req, res) => {
   const user = await User.findOne({ username: req.body.username, password: req.body.password });
   if (user) res.json(user);
   else res.status(400).json({ error: "Invalid credentials" });
 });
 
+// 3. Register
+app.post('/api/register', async (req, res) => {
+  try {
+    const user = await User.create({ username: req.body.username, password: req.body.password, balance: 10000 });
+    res.json(user);
+  } catch (err) { res.status(400).json({ error: "Username taken" }); }
+});
+
+// 4. Wallet
 app.post('/api/wallet', async (req, res) => {
     const { userId, amount, type } = req.body;
     const user = await User.findById(userId);
@@ -43,16 +81,22 @@ app.post('/api/wallet', async (req, res) => {
     res.json(user);
 });
 
-// --- POKER ENGINE ---
+// --- POKER ENGINE (Multi-Table) ---
 const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: "*" } });
 
-let gameState = {
-  roomId: "HighRollers",
-  players: [], communityCards: [], pot: 0, deck: [],
-  phase: 'waiting', turnIndex: 0, dealerIndex: 0, highestBet: 0, timer: 30, winners: []
-};
-let turnTimeout;
+const tables = {}; 
+
+const createTable = (id, name, smallBlind, bigBlind) => ({
+    id, name, smallBlind, bigBlind,
+    players: [], communityCards: [], pot: 0, deck: [],
+    phase: 'waiting', turnIndex: 0, dealerIndex: 0, highestBet: 0, 
+    timer: 30, winners: [], turnTimeout: null
+});
+
+tables['t1'] = createTable('t1', 'Casual ($10/$20)', 10, 20);
+tables['t2'] = createTable('t2', 'High Rollers ($50/$100)', 50, 100);
+tables['t3'] = createTable('t3', 'Heads Up ($100/$200)', 100, 200);
 
 const createDeck = () => {
   const suits = ['h', 'd', 'c', 's'];
@@ -62,85 +106,96 @@ const createDeck = () => {
   return deck.sort(() => Math.random() - 0.5);
 };
 
-const nextStage = () => {
-    clearInterval(turnTimeout);
-    gameState.players.forEach(p => { p.currentBet = 0; });
-    gameState.highestBet = 0;
+const broadcastTable = (tableId) => {
+    io.to(tableId).emit('gameState', { ...tables[tableId], turnTimeout: null });
+};
 
-    if (gameState.phase === 'preflop') {
-        gameState.phase = 'flop';
-        gameState.communityCards.push(gameState.deck.pop(), gameState.deck.pop(), gameState.deck.pop());
-    } else if (gameState.phase === 'flop') {
-        gameState.phase = 'turn';
-        gameState.communityCards.push(gameState.deck.pop());
-    } else if (gameState.phase === 'turn') {
-        gameState.phase = 'river';
-        gameState.communityCards.push(gameState.deck.pop());
+const nextStage = (tableId) => {
+    const table = tables[tableId];
+    clearInterval(table.turnTimeout);
+    table.players.forEach(p => { p.currentBet = 0; });
+    table.highestBet = 0;
+
+    if (table.phase === 'preflop') {
+        table.phase = 'flop';
+        table.communityCards.push(table.deck.pop(), table.deck.pop(), table.deck.pop());
+    } else if (table.phase === 'flop') {
+        table.phase = 'turn';
+        table.communityCards.push(table.deck.pop());
+    } else if (table.phase === 'turn') {
+        table.phase = 'river';
+        table.communityCards.push(table.deck.pop());
     } else {
-        solveHand(); return;
+        solveHand(tableId); return;
     }
     
-    rotateTurn();
-    io.emit('gameState', gameState);
-    startTurnTimer();
+    table.turnIndex = table.dealerIndex;
+    rotateTurn(tableId);
+    broadcastTable(tableId);
+    startTurnTimer(tableId);
 };
 
-const rotateTurn = () => {
+const rotateTurn = (tableId) => {
+    const table = tables[tableId];
     let attempts = 0;
     do {
-        gameState.turnIndex = (gameState.turnIndex + 1) % gameState.players.length;
+        table.turnIndex = (table.turnIndex + 1) % table.players.length;
         attempts++;
-    } while (gameState.players[gameState.turnIndex].folded && attempts < gameState.players.length);
+    } while (table.players[table.turnIndex].folded && attempts < table.players.length);
 };
 
-const startTurnTimer = () => {
-    clearInterval(turnTimeout);
-    gameState.timer = 30;
-    turnTimeout = setInterval(() => {
-        gameState.timer--;
-        if (gameState.timer <= 0) {
-            clearInterval(turnTimeout);
-            const p = gameState.players[gameState.turnIndex];
-            if(p) handleAction(p.id, 'fold', 0);
+const startTurnTimer = (tableId) => {
+    const table = tables[tableId];
+    clearInterval(table.turnTimeout);
+    table.timer = 30;
+    table.turnTimeout = setInterval(() => {
+        table.timer--;
+        if (table.timer <= 0) {
+            clearInterval(table.turnTimeout);
+            const p = table.players[table.turnIndex];
+            if(p) handleAction(tableId, p.id, 'fold', 0);
         }
-        io.emit('gameState', gameState);
+        io.to(tableId).emit('timerUpdate', table.timer); 
     }, 1000);
 };
 
-const handleAction = (socketId, type, amount) => {
-    const player = gameState.players.find(p => p.id === socketId);
-    if (!player || gameState.players[gameState.turnIndex].id !== socketId) return;
+const handleAction = (tableId, socketId, type, amount) => {
+    const table = tables[tableId];
+    if(!table) return;
+    const player = table.players.find(p => p.id === socketId);
+    if (!player || table.players[table.turnIndex].id !== socketId) return;
 
     if (type === 'fold') player.folded = true;
     else if (type === 'call') {
-        const toCall = gameState.highestBet - player.currentBet;
+        const toCall = table.highestBet - player.currentBet;
         player.balance -= toCall;
         player.currentBet += toCall;
-        gameState.pot += toCall;
+        table.pot += toCall;
     } else if (type === 'raise') {
         const total = Number(amount);
         const diff = total - player.currentBet;
         player.balance -= diff;
         player.currentBet = total;
-        gameState.pot += diff;
-        gameState.highestBet = total;
+        table.pot += diff;
+        table.highestBet = total;
     }
 
-    const active = gameState.players.filter(p => !p.folded);
-    const allMatched = active.every(p => p.currentBet === gameState.highestBet);
+    const active = table.players.filter(p => !p.folded);
+    const allMatched = active.every(p => p.currentBet === table.highestBet);
     
-    if (allMatched && active.length > 1) nextStage();
+    if (allMatched && active.length > 1) nextStage(tableId);
     else {
-        rotateTurn();
-        io.emit('gameState', gameState);
-        startTurnTimer();
+        rotateTurn(tableId);
+        broadcastTable(tableId);
+        startTurnTimer(tableId);
     }
 };
 
-const solveHand = async () => {
-    gameState.phase = 'showdown';
-    const playersForSolver = gameState.players.filter(p => !p.folded).map(p => {
-        const sevenCards = [...p.hand, ...gameState.communityCards].map(c => c.replace('0', 'T'));
+const solveHand = async (tableId) => {
+    const table = tables[tableId];
+    table.phase = 'showdown';
+    const playersForSolver = table.players.filter(p => !p.folded).map(p => {
+        const sevenCards = [...p.hand, ...table.communityCards].map(c => c.replace('0', 'T'));
         const hand = Hand.solve(sevenCards);
         hand.ownerId = p.dbId;
         hand.originalName = p.name;
@@ -148,75 +203,75 @@ const solveHand = async () => {
     });
 
     const winners = Hand.winners(playersForSolver);
-    const payout = Math.floor(gameState.pot / winners.length);
-    gameState.winners = winners.map(w => w.originalName);
+    const payout = Math.floor(table.pot / winners.length);
+    table.winners = winners.map(w => w.originalName);
 
     for (let w of winners) {
-        const player = gameState.players.find(p => p.dbId === w.ownerId);
+        const player = table.players.find(p => p.dbId === w.ownerId);
         if (player) player.balance += payout;
         await User.findByIdAndUpdate(w.ownerId, { $inc: { balance: payout } });
     }
-
-    io.emit('gameState', gameState);
-    setTimeout(startNewHand, 8000);
+    broadcastTable(tableId);
+    setTimeout(() => startNewHand(tableId), 8000);
 };
 
-const startNewHand = () => {
-    if (gameState.players.length < 2) { 
-        gameState.phase = 'waiting'; gameState.communityCards = []; gameState.pot = 0; gameState.winners = [];
-        io.emit('gameState', gameState); return; 
+const startNewHand = (tableId) => {
+    const table = tables[tableId];
+    if (table.players.length < 2) { 
+        table.phase = 'waiting'; table.communityCards = []; table.pot = 0; table.winners = [];
+        broadcastTable(tableId); return; 
     }
+    table.deck = createDeck();
+    table.communityCards = [];
+    table.pot = 0;
+    table.phase = 'preflop';
+    table.winners = [];
+    table.dealerIndex = (table.dealerIndex + 1) % table.players.length;
+    const sb = (table.dealerIndex + 1) % table.players.length;
+    const bb = (table.dealerIndex + 2) % table.players.length;
 
-    gameState.deck = createDeck();
-    gameState.communityCards = [];
-    gameState.pot = 0;
-    gameState.phase = 'preflop';
-    gameState.winners = [];
-    gameState.dealerIndex = (gameState.dealerIndex + 1) % gameState.players.length;
-    
-    const sb = (gameState.dealerIndex + 1) % gameState.players.length;
-    const bb = (gameState.dealerIndex + 2) % gameState.players.length;
-
-    gameState.players.forEach((p, i) => {
-        p.hand = [gameState.deck.pop(), gameState.deck.pop()];
+    table.players.forEach((p, i) => {
+        p.hand = [table.deck.pop(), table.deck.pop()];
         p.folded = false;
         p.currentBet = 0;
-        if (i === sb) { p.balance -= 10; p.currentBet = 10; gameState.pot += 10; }
-        if (i === bb) { p.balance -= 20; p.currentBet = 20; gameState.pot += 20; gameState.highestBet = 20; }
+        if (i === sb) { p.balance -= table.smallBlind; p.currentBet = table.smallBlind; table.pot += table.smallBlind; }
+        if (i === bb) { p.balance -= table.bigBlind; p.currentBet = table.bigBlind; table.pot += table.bigBlind; table.highestBet = table.bigBlind; }
     });
-
-    gameState.turnIndex = (bb + 1) % gameState.players.length;
-    startTurnTimer();
-    io.emit('gameState', gameState);
+    table.turnIndex = (bb + 1) % table.players.length;
+    broadcastTable(tableId);
+    startTurnTimer(tableId);
 };
 
 io.on('connection', (socket) => {
-    socket.on('joinGame', async ({ userId, buyIn }) => {
-        const user = await User.findById(userId);
-        if (!user || user.balance < buyIn) return;
-
-        await User.findByIdAndUpdate(userId, { $inc: { balance: -buyIn } });
-        gameState.players.push({
-            id: socket.id, dbId: userId, name: user.username,
-            balance: buyIn, hand: [], currentBet: 0, folded: false
-        });
-
-        if (gameState.players.length >= 2 && gameState.phase === 'waiting') startNewHand();
-        else io.emit('gameState', gameState);
+    socket.on('getTables', () => {
+        const list = Object.values(tables).map(t => ({ id: t.id, name: t.name, players: t.players.length, sb: t.smallBlind, bb: t.bigBlind }));
+        socket.emit('tableList', list);
     });
-
-    socket.on('leaveGame', async () => {
-        const idx = gameState.players.findIndex(p => p.id === socket.id);
+    socket.on('joinTable', async ({ tableId, userId, buyIn }) => {
+        const table = tables[tableId];
+        const user = await User.findById(userId);
+        if (!table || !user || user.balance < buyIn) return;
+        socket.leave(tableId); 
+        await User.findByIdAndUpdate(userId, { $inc: { balance: -buyIn } });
+        socket.join(tableId);
+        table.players.push({ id: socket.id, dbId: userId, name: user.username, balance: buyIn, hand: [], currentBet: 0, folded: false });
+        if (table.players.length >= 2 && table.phase === 'waiting') startNewHand(tableId);
+        else broadcastTable(tableId);
+    });
+    socket.on('leaveTable', async ({ tableId }) => {
+        const table = tables[tableId];
+        if(!table) return;
+        const idx = table.players.findIndex(p => p.id === socket.id);
         if (idx !== -1) {
-            const p = gameState.players[idx];
+            const p = table.players[idx];
             await User.findByIdAndUpdate(p.dbId, { $inc: { balance: p.balance } });
-            gameState.players.splice(idx, 1);
-            if(gameState.players.length < 2) { gameState.phase = 'waiting'; clearInterval(turnTimeout); }
-            io.emit('gameState', gameState);
+            table.players.splice(idx, 1);
+            socket.leave(tableId);
+            if(table.players.length < 2) { table.phase = 'waiting'; clearInterval(table.turnTimeout); }
+            broadcastTable(tableId);
         }
     });
-
-    socket.on('action', ({ type, amount }) => handleAction(socket.id, type, amount));
+    socket.on('action', ({ tableId, type, amount }) => handleAction(tableId, socket.id, type, amount));
 });
 
 server.listen(process.env.PORT || 10000);
