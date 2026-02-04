@@ -9,7 +9,6 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// --- YOUR GOOGLE CLIENT ID ---
 const GOOGLE_CLIENT_ID = "67123336647-b00rcsb6ni8s8unhi3qqg0bk6l2es62l.apps.googleusercontent.com"; 
 const client = new OAuth2Client(GOOGLE_CLIENT_ID);
 
@@ -31,9 +30,12 @@ app.get('/api/user/:id', async (req, res) => {
     res.json(user);
 });
 
-// --- GAME 1: BLACKJACK LOGIC ---
+// --- IN-MEMORY GAME STATE (For active sessions) ---
+const games = {}; // { userId: { type: 'mines', bet: 10, state: ... } }
+
+// --- GAME 1: BLACKJACK (Standard) ---
 const generateDeck = () => ['2','3','4','5','6','7','8','9','10','J','Q','K','A'].flatMap(r=>['h','d','c','s'].map(s=>({rank:r, suit:s}))).sort(()=>Math.random()-.5);
-const getVal = (hand) => {
+const getBjVal = (hand) => {
     let val = 0, aces = 0;
     hand.forEach(c => {
         if(['J','Q','K'].includes(c.rank)) val += 10;
@@ -44,153 +46,153 @@ const getVal = (hand) => {
     return val;
 };
 
-// Store active blackjack games in memory
-const bjGames = {}; 
-
 app.post('/api/blackjack/deal', async (req, res) => {
     const { userId, bet } = req.body;
     const user = await User.findById(userId);
-    if(user.balance < bet) return res.status(400).json({error: "No Funds"});
-    
-    user.balance -= bet;
-    await user.save();
+    if(user.balance < bet) return res.status(400).json({error: "Funds"});
+    user.balance -= bet; await user.save();
 
     const deck = generateDeck();
-    const playerHand = [deck.pop(), deck.pop()];
-    const dealerHand = [deck.pop(), deck.pop()];
-    
-    bjGames[userId] = { deck, playerHand, dealerHand, bet, status: 'playing' };
-    
-    // Check Instant Blackjack
-    if(getVal(playerHand) === 21) {
-        user.balance += bet * 2.5;
-        await user.save();
-        bjGames[userId].status = 'won';
-    }
+    const pHand = [deck.pop(), deck.pop()];
+    const dHand = [deck.pop(), deck.pop()];
+    games[userId] = { type: 'bj', deck, pHand, dHand, bet, status: 'playing' };
 
-    res.json({ ...bjGames[userId], dealerHand: [dealerHand[0], {rank:'?', suit:'?'}] }); // Hide dealer 2nd card
+    if(getBjVal(pHand) === 21) {
+        user.balance += bet * 2.5; await user.save();
+        games[userId].status = 'blackjack';
+    }
+    res.json({ ...games[userId], dHand: [dHand[0], {rank:'?', suit:'?'}] });
 });
 
-app.post('/api/blackjack/hit', async (req, res) => {
-    const game = bjGames[req.body.userId];
-    if(!game || game.status !== 'playing') return res.status(400).json({error: "No Game"});
-    
-    game.playerHand.push(game.deck.pop());
-    const val = getVal(game.playerHand);
-    
-    if(val > 21) {
-        game.status = 'bust';
-        // No refund
-    }
-    res.json({ ...game, dealerHand: [game.dealerHand[0], {rank:'?', suit:'?'}] });
-});
+app.post('/api/blackjack/action', async (req, res) => {
+    const { userId, action } = req.body; // hit or stand
+    const g = games[userId];
+    if(!g || g.type !== 'bj') return res.status(400);
 
-app.post('/api/blackjack/stand', async (req, res) => {
-    const { userId } = req.body;
-    const game = bjGames[userId];
-    if(!game) return res.status(400).json({error: "No Game"});
-    
-    let dVal = getVal(game.dealerHand);
-    while(dVal < 17) {
-        game.dealerHand.push(game.deck.pop());
-        dVal = getVal(game.dealerHand);
-    }
-    
-    const pVal = getVal(game.playerHand);
-    const user = await User.findById(userId);
-
-    if(dVal > 21 || pVal > dVal) {
-        game.status = 'won';
-        user.balance += game.bet * 2;
-    } else if (pVal === dVal) {
-        game.status = 'push';
-        user.balance += game.bet;
+    if(action === 'hit') {
+        g.pHand.push(g.deck.pop());
+        if(getBjVal(g.pHand) > 21) { g.status = 'bust'; delete games[userId]; }
     } else {
-        game.status = 'lost';
+        while(getBjVal(g.dHand) < 17) g.dHand.push(g.deck.pop());
+        const pVal = getBjVal(g.pHand);
+        const dVal = getBjVal(g.dHand);
+        const user = await User.findById(userId);
+        
+        if(dVal > 21 || pVal > dVal) { g.status = 'won'; user.balance += g.bet * 2; }
+        else if(pVal === dVal) { g.status = 'push'; user.balance += g.bet; }
+        else { g.status = 'lost'; }
+        await user.save();
+        delete games[userId];
     }
-    await user.save();
-    res.json(game); // Reveal all
+    res.json(g);
 });
 
-
-// --- GAME 2: MINES LOGIC ---
-app.post('/api/mines/play', async (req, res) => {
-    const { userId, bet, minesCount, clickedTile } = req.body;
-    // Simplified: Single Request = Full Game for simplicity, or complex state.
-    // Let's do a simple "Result" logic for immediate outcome (Provably Fair style)
-    
+// --- GAME 2: MINES (With Cashout & Multipliers) ---
+app.post('/api/mines/start', async (req, res) => {
+    const { userId, bet, mines } = req.body;
     const user = await User.findById(userId);
-    if(user.balance < bet) return res.status(400).json({error: "No Funds"});
-    
-    user.balance -= bet;
-    
-    // Generate grid
+    if(user.balance < bet) return res.status(400).json({error: "Funds"});
+    user.balance -= bet; await user.save();
+
+    // Generate Board
     let grid = Array(25).fill('gem');
-    for(let i=0; i<minesCount; i++) grid[i] = 'bomb';
-    grid = grid.sort(() => Math.random() - 0.5);
+    for(let i=0; i<mines; i++) grid[i] = 'bomb';
+    grid = grid.sort(()=>Math.random()-.5);
 
-    // If user clicked a bomb
-    const result = grid[clickedTile];
-    let win = 0;
-    
-    if (result === 'gem') {
-        // Simple multiplier logic: 1.2x to 5x based on mines
-        const mult = 1 + (minesCount * 0.15); 
-        win = Math.floor(bet * mult);
-        user.balance += win;
-    }
-    
-    await user.save();
-    res.json({ result, grid, newBalance: user.balance, win });
+    games[userId] = { 
+        type: 'mines', bet, mines, grid, 
+        revealed: Array(25).fill(false), 
+        status: 'playing', multiplier: 1.0, 
+        nextPayout: bet 
+    };
+    res.json({ status: 'playing', revealed: Array(25).fill(false), multiplier: 1.0, nextPayout: bet });
 });
 
+app.post('/api/mines/click', async (req, res) => {
+    const { userId, tile } = req.body;
+    const g = games[userId];
+    if(!g || g.type !== 'mines') return res.status(400);
 
-// --- GAME 3: KENO LOGIC ---
-app.post('/api/keno/play', async (req, res) => {
-    const { userId, bet, numbers } = req.body;
-    const user = await User.findById(userId);
-    if(user.balance < bet) return res.status(400).json({error: "No Funds"});
-    
-    user.balance -= bet;
-    
-    // Draw 10 numbers
-    const draw = [];
-    while(draw.length < 10) {
-        const n = Math.floor(Math.random() * 40) + 1;
-        if(!draw.includes(n)) draw.push(n);
+    if(g.grid[tile] === 'bomb') {
+        g.status = 'boom';
+        g.revealed[tile] = true;
+        delete games[userId];
+        res.json({ status: 'boom', grid: g.grid }); // Show all
+    } else {
+        g.revealed[tile] = true;
+        // Calculate Multiplier: Classic Probability Math
+        const tilesLeft = 25 - g.revealed.filter(Boolean).length;
+        const gemsLeft = 25 - g.mines - (g.revealed.filter(Boolean).length - 1); // -1 because we just found one? No.
+        // Simplified Math: 0.99 * (25 / (25 - mines - found))
+        const found = g.revealed.filter(Boolean).length;
+        g.multiplier = g.multiplier * ( (25 - found + 1) / (25 - g.mines - found + 1) );
+        g.nextPayout = g.bet * g.multiplier;
+        
+        res.json({ status: 'playing', revealed: g.revealed, multiplier: g.multiplier, nextPayout: g.nextPayout });
     }
-    
-    const matches = numbers.filter(n => draw.includes(n)).length;
-    let payout = 0;
-    
-    // Payout Table
-    if(matches >= 2) payout = bet * matches; 
-    if(matches >= 5) payout = bet * (matches * 2);
-    
-    user.balance += payout;
-    await user.save();
-    res.json({ draw, matches, payout, newBalance: user.balance });
 });
 
-// --- GAME 4: DRAGON TOWER LOGIC ---
-app.post('/api/dragon/play', async (req, res) => {
-    const { userId, bet, difficulty } = req.body; // difficulty: 'easy' (2/3 safe), 'hard' (1/3 safe)
+app.post('/api/mines/cashout', async (req, res) => {
+    const { userId } = req.body;
+    const g = games[userId];
+    if(!g || g.type !== 'mines') return res.status(400);
+
+    const win = g.bet * g.multiplier;
     const user = await User.findById(userId);
-    if(user.balance < bet) return res.status(400).json({error: "No Funds"});
-
-    user.balance -= bet;
-
-    const isSafe = Math.random() > (difficulty === 'hard' ? 0.6 : 0.3);
-    let win = 0;
-    
-    if(isSafe) {
-        const mult = difficulty === 'hard' ? 2.5 : 1.4;
-        win = Math.floor(bet * mult);
-        user.balance += win;
-    }
-
+    user.balance += win;
     await user.save();
-    res.json({ result: isSafe ? 'safe' : 'dead', win, newBalance: user.balance });
+    delete games[userId];
+    res.json({ status: 'cashed_out', win });
+});
+
+// --- GAME 3: DRAGON TOWER (Row by Row) ---
+const DRAGON_MULTS = { 'easy': [1.2, 1.5, 1.9, 2.4, 3.1, 4.0, 5.2, 7.0], 'hard': [1.9, 3.8, 7.6, 15.2, 30.4, 60.8] };
+
+app.post('/api/dragon/start', async (req, res) => {
+    const { userId, bet, difficulty } = req.body;
+    const user = await User.findById(userId);
+    if(user.balance < bet) return res.status(400).json({error: "Funds"});
+    user.balance -= bet; await user.save();
+
+    games[userId] = { 
+        type: 'dragon', bet, difficulty, 
+        row: 0, status: 'playing', 
+        history: [] // record safe steps
+    };
+    res.json({ status: 'playing', row: 0, multiplier: 1.0 });
+});
+
+app.post('/api/dragon/step', async (req, res) => {
+    const { userId, choice } = req.body; // 0, 1, 2
+    const g = games[userId];
+    if(!g || g.type !== 'dragon') return res.status(400);
+
+    // Logic: Hard = 1 safe out of 3. Easy = 2 safe out of 3.
+    const isSafe = Math.random() > (g.difficulty === 'hard' ? 0.66 : 0.33);
+    
+    if(!isSafe) {
+        g.status = 'dead';
+        delete games[userId];
+        res.json({ status: 'dead' });
+    } else {
+        g.row++;
+        g.history.push(choice);
+        const mult = DRAGON_MULTS[g.difficulty][g.row - 1] || (g.row * 2); // Fallback
+        g.multiplier = mult;
+        res.json({ status: 'playing', row: g.row, multiplier: mult, payout: g.bet * mult });
+    }
+});
+
+app.post('/api/dragon/cashout', async (req, res) => {
+    const { userId } = req.body;
+    const g = games[userId];
+    if(!g) return res.status(400);
+    
+    const win = g.bet * (g.multiplier || 1);
+    const user = await User.findById(userId);
+    user.balance += win; await user.save();
+    delete games[userId];
+    res.json({ status: 'cashed_out', win });
 });
 
 app.listen(process.env.PORT || 10000);
