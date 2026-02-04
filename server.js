@@ -12,7 +12,7 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// --- YOUR GOOGLE CLIENT ID INTEGRATED ---
+// --- YOUR GOOGLE CLIENT ID ---
 const GOOGLE_CLIENT_ID = "67123336647-b00rcsb6ni8s8unhi3qqg0bk6l2es62l.apps.googleusercontent.com"; 
 const client = new OAuth2Client(GOOGLE_CLIENT_ID);
 
@@ -73,16 +73,15 @@ const handleAction = (tableId, sid, type, amt) => {
         if (active.length === 1) { 
             active[0].balance += t.pot; 
             t.phase = 'showdown'; t.winners = [active[0].name];
-            broadcast(tableId); 
-            setTimeout(() => startNewHand(tableId), 4000); 
-            return;
+            broadcast(tableId); setTimeout(() => startNewHand(tableId), 4000); return;
         }
     } else if (type === 'call') {
         const diff = t.highestBet - p.bet;
         p.balance -= diff; p.bet += diff; t.pot += diff;
     } else if (type === 'raise') {
-        const diff = amt - p.bet;
-        p.balance -= diff; p.bet = amt; t.pot += diff; t.highestBet = amt;
+        const total = Number(amt);
+        const diff = total - p.bet;
+        p.balance -= diff; p.bet = total; t.pot += diff; t.highestBet = total;
         t.players.forEach(pl => { if(pl.id !== sid) pl.acted = false; });
     }
 
