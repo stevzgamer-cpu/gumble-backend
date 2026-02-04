@@ -1,10 +1,7 @@
 require('dotenv').config();
 const express = require('express');
-const http = require('http');
 const mongoose = require('mongoose');
 const cors = require('cors');
-const { Server } = require('socket.io');
-const { Hand } = require('pokersolver'); 
 const { OAuth2Client } = require('google-auth-library');
 const User = require('./models/User');
 
@@ -19,117 +16,181 @@ const client = new OAuth2Client(GOOGLE_CLIENT_ID);
 mongoose.connect(process.env.MONGO_URI).then(() => console.log("✅ DB Connected"));
 
 // --- AUTH ---
-app.post('/api/google-login', async (req, res) => {
-    const { token } = req.body;
+app.post('/api/auth/google', async (req, res) => {
     try {
-        const ticket = await client.verifyIdToken({ idToken: token, audience: GOOGLE_CLIENT_ID });
+        const ticket = await client.verifyIdToken({ idToken: req.body.token, audience: GOOGLE_CLIENT_ID });
         const { name, email } = ticket.getPayload();
         let user = await User.findOne({ email });
         if (!user) user = await User.create({ username: name, email, balance: 10000 });
         res.json(user);
-    } catch (error) { res.status(400).send(); }
+    } catch (e) { res.status(400).json({ error: "Auth Failed" }); }
 });
 
-app.post('/api/login', async (req, res) => {
-  const user = await User.findOne({ username: req.body.username, password: req.body.password });
-  if (user) res.json(user); else res.status(400).json({ error: "Fail" });
+app.get('/api/user/:id', async (req, res) => {
+    const user = await User.findById(req.params.id);
+    res.json(user);
 });
 
-// --- POKER ENGINE ---
-const server = http.createServer(app);
-const io = new Server(server, { cors: { origin: "*" } });
-const tables = {}; 
-
-['Casual', 'High Rollers'].forEach((name, i) => {
-    const id = `t${i+1}`;
-    tables[id] = { id, name, sb: (i+1)*10, bb: (i+1)*20, players: [], communityCards: [], pot: 0, deck: [], phase: 'waiting', turnIndex: 0, highestBet: 0, winners: [] };
-});
-
-const startNewHand = (tableId) => {
-    const t = tables[tableId];
-    if (t.players.length < 2) { t.phase = 'waiting'; broadcast(tableId); return; }
-    t.deck = ['2','3','4','5','6','7','8','9','T','J','Q','K','A'].flatMap(r => ['h','c','d','s'].map(s => r+s)).sort(() => Math.random() - 0.5);
-    t.communityCards = []; t.pot = 0; t.phase = 'preflop'; t.winners = [];
-    t.players.forEach((p, i) => {
-        p.hand = [t.deck.pop(), t.deck.pop()]; p.folded = false; p.acted = false; p.bet = 0;
-        if (i === 0) { p.bet = t.sb; p.balance -= t.sb; t.pot += t.sb; }
-        if (i === 1) { p.bet = t.bb; p.balance -= t.bb; t.pot += t.bb; t.highestBet = t.bb; }
+// --- GAME 1: BLACKJACK LOGIC ---
+const generateDeck = () => ['2','3','4','5','6','7','8','9','10','J','Q','K','A'].flatMap(r=>['h','d','c','s'].map(s=>({rank:r, suit:s}))).sort(()=>Math.random()-.5);
+const getVal = (hand) => {
+    let val = 0, aces = 0;
+    hand.forEach(c => {
+        if(['J','Q','K'].includes(c.rank)) val += 10;
+        else if(c.rank === 'A') { val += 11; aces++; }
+        else val += parseInt(c.rank);
     });
-    t.turnIndex = t.players.length > 2 ? 2 : 0;
-    broadcast(tableId);
+    while(val > 21 && aces > 0) { val -= 10; aces--; }
+    return val;
 };
 
-const broadcast = (id) => io.to(id).emit('gameState', tables[id]);
+// Store active blackjack games in memory
+const bjGames = {}; 
 
-const handleAction = (tableId, sid, type, amt) => {
-    const t = tables[tableId];
-    const p = t.players.find(pl => pl.id === sid);
-    if (!p || t.players[t.turnIndex].id !== sid) return;
+app.post('/api/blackjack/deal', async (req, res) => {
+    const { userId, bet } = req.body;
+    const user = await User.findById(userId);
+    if(user.balance < bet) return res.status(400).json({error: "No Funds"});
+    
+    user.balance -= bet;
+    await user.save();
 
-    p.acted = true;
-    if (type === 'fold') {
-        p.folded = true;
-        const active = t.players.filter(pl => !pl.folded);
-        if (active.length === 1) { 
-            active[0].balance += t.pot; 
-            t.phase = 'showdown'; t.winners = [active[0].name];
-            broadcast(tableId); setTimeout(() => startNewHand(tableId), 4000); return;
-        }
-    } else if (type === 'call') {
-        const diff = t.highestBet - p.bet;
-        p.balance -= diff; p.bet += diff; t.pot += diff;
-    } else if (type === 'raise') {
-        const total = Number(amt);
-        const diff = total - p.bet;
-        p.balance -= diff; p.bet = total; t.pot += diff; t.highestBet = total;
-        t.players.forEach(pl => { if(pl.id !== sid) pl.acted = false; });
+    const deck = generateDeck();
+    const playerHand = [deck.pop(), deck.pop()];
+    const dealerHand = [deck.pop(), deck.pop()];
+    
+    bjGames[userId] = { deck, playerHand, dealerHand, bet, status: 'playing' };
+    
+    // Check Instant Blackjack
+    if(getVal(playerHand) === 21) {
+        user.balance += bet * 2.5;
+        await user.save();
+        bjGames[userId].status = 'won';
     }
 
-    const active = t.players.filter(pl => !pl.folded);
-    if (active.every(pl => pl.bet === t.highestBet && pl.acted)) {
-        if (t.phase === 'river') solve(tableId); else nextStage(tableId);
+    res.json({ ...bjGames[userId], dealerHand: [dealerHand[0], {rank:'?', suit:'?'}] }); // Hide dealer 2nd card
+});
+
+app.post('/api/blackjack/hit', async (req, res) => {
+    const game = bjGames[req.body.userId];
+    if(!game || game.status !== 'playing') return res.status(400).json({error: "No Game"});
+    
+    game.playerHand.push(game.deck.pop());
+    const val = getVal(game.playerHand);
+    
+    if(val > 21) {
+        game.status = 'bust';
+        // No refund
+    }
+    res.json({ ...game, dealerHand: [game.dealerHand[0], {rank:'?', suit:'?'}] });
+});
+
+app.post('/api/blackjack/stand', async (req, res) => {
+    const { userId } = req.body;
+    const game = bjGames[userId];
+    if(!game) return res.status(400).json({error: "No Game"});
+    
+    let dVal = getVal(game.dealerHand);
+    while(dVal < 17) {
+        game.dealerHand.push(game.deck.pop());
+        dVal = getVal(game.dealerHand);
+    }
+    
+    const pVal = getVal(game.playerHand);
+    const user = await User.findById(userId);
+
+    if(dVal > 21 || pVal > dVal) {
+        game.status = 'won';
+        user.balance += game.bet * 2;
+    } else if (pVal === dVal) {
+        game.status = 'push';
+        user.balance += game.bet;
     } else {
-        do { t.turnIndex = (t.turnIndex + 1) % t.players.length; } while (t.players[t.turnIndex].folded);
-        broadcast(tableId);
+        game.status = 'lost';
     }
-};
-
-const nextStage = (id) => {
-    const t = tables[id];
-    t.highestBet = 0; t.players.forEach(pl => { pl.bet = 0; pl.acted = false; });
-    if (t.phase === 'preflop') t.communityCards.push(t.deck.pop(), t.deck.pop(), t.deck.pop());
-    else t.communityCards.push(t.deck.pop());
-    t.phase = t.phase === 'preflop' ? 'flop' : (t.phase === 'flop' ? 'turn' : 'river');
-    t.turnIndex = 0; broadcast(id);
-};
-
-const solve = (id) => {
-    const t = tables[id]; t.phase = 'showdown';
-    const hands = t.players.filter(pl => !pl.folded).map(pl => {
-        const s = Hand.solve([...pl.hand, ...t.communityCards].map(c => c.replace('0','T')));
-        s.name = pl.name; s.dbId = pl.dbId; return s;
-    });
-    const winners = Hand.winners(hands);
-    t.winners = winners.map(w => w.name);
-    const payout = t.pot / winners.length;
-    winners.forEach(w => {
-        const pl = t.players.find(p => p.dbId === w.dbId);
-        pl.balance += payout;
-        User.findByIdAndUpdate(w.dbId, { $inc: { balance: payout } }).exec();
-    });
-    broadcast(id); setTimeout(() => startNewHand(id), 8000);
-};
-
-io.on('connection', (s) => {
-    s.on('joinTable', async ({ tableId, userId, buyIn }) => {
-        const user = await User.findById(userId);
-        if (!user) return;
-        s.join(tableId);
-        tables[tableId].players.push({ id: s.id, dbId: userId, name: user.username, balance: buyIn, hand: [], bet: 0, folded: false, acted: false });
-        if (tables[tableId].players.length >= 2 && tables[tableId].phase === 'waiting') startNewHand(tableId);
-        else broadcast(tableId);
-    });
-    s.on('action', (d) => handleAction(d.tableId, s.id, d.type, d.amount));
+    await user.save();
+    res.json(game); // Reveal all
 });
 
-server.listen(process.env.PORT || 10000);
+
+// --- GAME 2: MINES LOGIC ---
+app.post('/api/mines/play', async (req, res) => {
+    const { userId, bet, minesCount, clickedTile } = req.body;
+    // Simplified: Single Request = Full Game for simplicity, or complex state.
+    // Let's do a simple "Result" logic for immediate outcome (Provably Fair style)
+    
+    const user = await User.findById(userId);
+    if(user.balance < bet) return res.status(400).json({error: "No Funds"});
+    
+    user.balance -= bet;
+    
+    // Generate grid
+    let grid = Array(25).fill('gem');
+    for(let i=0; i<minesCount; i++) grid[i] = 'bomb';
+    grid = grid.sort(() => Math.random() - 0.5);
+
+    // If user clicked a bomb
+    const result = grid[clickedTile];
+    let win = 0;
+    
+    if (result === 'gem') {
+        // Simple multiplier logic: 1.2x to 5x based on mines
+        const mult = 1 + (minesCount * 0.15); 
+        win = Math.floor(bet * mult);
+        user.balance += win;
+    }
+    
+    await user.save();
+    res.json({ result, grid, newBalance: user.balance, win });
+});
+
+
+// --- GAME 3: KENO LOGIC ---
+app.post('/api/keno/play', async (req, res) => {
+    const { userId, bet, numbers } = req.body;
+    const user = await User.findById(userId);
+    if(user.balance < bet) return res.status(400).json({error: "No Funds"});
+    
+    user.balance -= bet;
+    
+    // Draw 10 numbers
+    const draw = [];
+    while(draw.length < 10) {
+        const n = Math.floor(Math.random() * 40) + 1;
+        if(!draw.includes(n)) draw.push(n);
+    }
+    
+    const matches = numbers.filter(n => draw.includes(n)).length;
+    let payout = 0;
+    
+    // Payout Table
+    if(matches >= 2) payout = bet * matches; 
+    if(matches >= 5) payout = bet * (matches * 2);
+    
+    user.balance += payout;
+    await user.save();
+    res.json({ draw, matches, payout, newBalance: user.balance });
+});
+
+// --- GAME 4: DRAGON TOWER LOGIC ---
+app.post('/api/dragon/play', async (req, res) => {
+    const { userId, bet, difficulty } = req.body; // difficulty: 'easy' (2/3 safe), 'hard' (1/3 safe)
+    const user = await User.findById(userId);
+    if(user.balance < bet) return res.status(400).json({error: "No Funds"});
+
+    user.balance -= bet;
+
+    const isSafe = Math.random() > (difficulty === 'hard' ? 0.6 : 0.3);
+    let win = 0;
+    
+    if(isSafe) {
+        const mult = difficulty === 'hard' ? 2.5 : 1.4;
+        win = Math.floor(bet * mult);
+        user.balance += win;
+    }
+
+    await user.save();
+    res.json({ result: isSafe ? 'safe' : 'dead', win, newBalance: user.balance });
+});
+
+app.listen(process.env.PORT || 10000);
