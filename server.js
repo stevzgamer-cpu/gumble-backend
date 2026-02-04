@@ -12,291 +12,125 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// --- ⚠️ PASTE YOUR GOOGLE CLIENT ID HERE ---
+// --- YOUR GOOGLE CLIENT ID INTEGRATED ---
 const GOOGLE_CLIENT_ID = "67123336647-b00rcsb6ni8s8unhi3qqg0bk6l2es62l.apps.googleusercontent.com"; 
 const client = new OAuth2Client(GOOGLE_CLIENT_ID);
 
-mongoose.connect(process.env.MONGO_URI)
-  .then(() => console.log("✅ MongoDB Connected"))
-  .catch(err => console.error("❌ DB Error:", err));
+mongoose.connect(process.env.MONGO_URI).then(() => console.log("✅ DB Connected"));
 
-// --- AUTH & WALLET ---
+// --- AUTH ---
 app.post('/api/google-login', async (req, res) => {
     const { token } = req.body;
     try {
         const ticket = await client.verifyIdToken({ idToken: token, audience: GOOGLE_CLIENT_ID });
         const { name, email } = ticket.getPayload();
         let user = await User.findOne({ email });
-        if (!user) user = await User.create({ username: name, email, balance: 10000, password: "" });
+        if (!user) user = await User.create({ username: name, email, balance: 10000 });
         res.json(user);
-    } catch (error) { res.status(400).json({ error: "Google Auth Failed" }); }
+    } catch (error) { res.status(400).send(); }
 });
 
 app.post('/api/login', async (req, res) => {
   const user = await User.findOne({ username: req.body.username, password: req.body.password });
-  if (user) res.json(user); else res.status(400).json({ error: "Invalid credentials" });
+  if (user) res.json(user); else res.status(400).json({ error: "Fail" });
 });
 
-app.post('/api/register', async (req, res) => {
-  try {
-    const user = await User.create({ username: req.body.username, password: req.body.password, balance: 10000 });
-    res.json(user);
-  } catch (err) { res.status(400).json({ error: "Username taken" }); }
-});
-
-// --- POKER LOGIC ---
+// --- POKER ENGINE ---
 const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: "*" } });
 const tables = {}; 
 
-['Casual', 'High Rollers', 'Pro'].forEach((name, i) => {
+['Casual', 'High Rollers'].forEach((name, i) => {
     const id = `t${i+1}`;
-    tables[id] = {
-        id, name, smallBlind: (i+1)*10, bigBlind: (i+1)*20,
-        players: [], communityCards: [], pot: 0, deck: [],
-        phase: 'waiting', turnIndex: 0, dealerIndex: 0, highestBet: 0, 
-        timer: 30, winners: [], turnTimeout: null
-    };
+    tables[id] = { id, name, sb: (i+1)*10, bb: (i+1)*20, players: [], communityCards: [], pot: 0, deck: [], phase: 'waiting', turnIndex: 0, highestBet: 0, winners: [] };
 });
 
-const createDeck = () => {
-  const suits = ['h', 'd', 'c', 's'];
-  const ranks = ['2', '3', '4', '5', '6', '7', '8', '9', 'T', 'J', 'Q', 'K', 'A'];
-  let deck = [];
-  for (let s of suits) for (let r of ranks) deck.push(r + s);
-  return deck.sort(() => Math.random() - 0.5);
-};
-
-const broadcast = (tableId) => {
-    if(tables[tableId]) io.to(tableId).emit('gameState', { ...tables[tableId], turnTimeout: null });
-};
-
-const nextStage = (tableId) => {
-    const table = tables[tableId];
-    clearInterval(table.turnTimeout);
-    table.highestBet = 0;
-    table.players.forEach(p => p.actedThisRound = false);
-
-    if (table.phase === 'preflop') {
-        table.phase = 'flop';
-        table.communityCards.push(table.deck.pop(), table.deck.pop(), table.deck.pop());
-    } else if (table.phase === 'flop') {
-        table.phase = 'turn';
-        table.communityCards.push(table.deck.pop());
-    } else if (table.phase === 'turn') {
-        table.phase = 'river';
-        table.communityCards.push(table.deck.pop());
-    } else {
-        solveHand(tableId); return;
-    }
-    
-    // Rotate turn to first active player left of dealer
-    table.turnIndex = table.dealerIndex;
-    rotateTurn(tableId);
+const startNewHand = (tableId) => {
+    const t = tables[tableId];
+    if (t.players.length < 2) { t.phase = 'waiting'; broadcast(tableId); return; }
+    t.deck = ['2','3','4','5','6','7','8','9','T','J','Q','K','A'].flatMap(r => ['h','c','d','s'].map(s => r+s)).sort(() => Math.random() - 0.5);
+    t.communityCards = []; t.pot = 0; t.phase = 'preflop'; t.winners = [];
+    t.players.forEach((p, i) => {
+        p.hand = [t.deck.pop(), t.deck.pop()]; p.folded = false; p.acted = false; p.bet = 0;
+        if (i === 0) { p.bet = t.sb; p.balance -= t.sb; t.pot += t.sb; }
+        if (i === 1) { p.bet = t.bb; p.balance -= t.bb; t.pot += t.bb; t.highestBet = t.bb; }
+    });
+    t.turnIndex = t.players.length > 2 ? 2 : 0;
     broadcast(tableId);
-    startTimer(tableId);
 };
 
-const rotateTurn = (tableId) => {
-    const table = tables[tableId];
-    let attempts = 0;
-    do {
-        table.turnIndex = (table.turnIndex + 1) % table.players.length;
-        attempts++;
-    } while ((table.players[table.turnIndex].folded || table.players[table.turnIndex].balance === 0) && attempts < table.players.length);
-};
+const broadcast = (id) => io.to(id).emit('gameState', tables[id]);
 
-const startTimer = (tableId) => {
-    const table = tables[tableId];
-    clearInterval(table.turnTimeout);
-    if(table.players.filter(p => !p.folded).length < 2) return;
+const handleAction = (tableId, sid, type, amt) => {
+    const t = tables[tableId];
+    const p = t.players.find(pl => pl.id === sid);
+    if (!p || t.players[t.turnIndex].id !== sid) return;
 
-    table.timer = 30;
-    table.turnTimeout = setInterval(() => {
-        table.timer--;
-        if (table.timer <= 0) {
-            clearInterval(table.turnTimeout);
-            const p = table.players[table.turnIndex];
-            if(p) handleAction(tableId, p.id, 'fold', 0);
-        }
-        io.to(tableId).emit('timerUpdate', table.timer); 
-    }, 1000);
-};
-
-const handleAction = (tableId, socketId, type, amount) => {
-    const table = tables[tableId];
-    if(!table) return;
-    const p = table.players.find(player => player.id === socketId);
-    
-    // Strict Validation
-    if(!p || table.players[table.turnIndex].id !== socketId) return;
-
-    p.actedThisRound = true;
-
+    p.acted = true;
     if (type === 'fold') {
         p.folded = true;
-        const active = table.players.filter(player => !player.folded);
-        if (active.length === 1) { endHandImmediate(tableId, active[0]); return; }
-    }
-    else if (type === 'check') {
-        if (table.highestBet > p.currentBet) return; // Cannot check if there is a bet
-    }
-    else if (type === 'call') {
-        const toCall = table.highestBet - p.currentBet;
-        const actualBet = Math.min(toCall, p.balance);
-        p.balance -= actualBet;
-        p.currentBet += actualBet;
-        table.pot += actualBet;
-    }
-    else if (type === 'raise') {
-        const totalBet = Number(amount);
-        if (totalBet <= table.highestBet) return; // Must be higher
-        const diff = totalBet - p.currentBet;
-        if (p.balance < diff) return; // Insufficient funds
-
-        p.balance -= diff;
-        p.currentBet = totalBet;
-        table.pot += diff;
-        table.highestBet = totalBet;
-        // Re-open betting for others
-        table.players.forEach(pl => { if(pl.id !== p.id) pl.actedThisRound = false; });
+        const active = t.players.filter(pl => !pl.folded);
+        if (active.length === 1) { 
+            active[0].balance += t.pot; 
+            t.phase = 'showdown'; t.winners = [active[0].name];
+            broadcast(tableId); 
+            setTimeout(() => startNewHand(tableId), 4000); 
+            return;
+        }
+    } else if (type === 'call') {
+        const diff = t.highestBet - p.bet;
+        p.balance -= diff; p.bet += diff; t.pot += diff;
+    } else if (type === 'raise') {
+        const diff = amt - p.bet;
+        p.balance -= diff; p.bet = amt; t.pot += diff; t.highestBet = amt;
+        t.players.forEach(pl => { if(pl.id !== sid) pl.acted = false; });
     }
 
-    // Check if round is over
-    const active = table.players.filter(pl => !pl.folded && pl.balance > 0);
-    const allMatched = active.every(pl => pl.currentBet === table.highestBet);
-    const allActed = active.every(pl => pl.actedThisRound);
-
-    if (allMatched && allActed) {
-        nextStage(tableId);
+    const active = t.players.filter(pl => !pl.folded);
+    if (active.every(pl => pl.bet === t.highestBet && pl.acted)) {
+        if (t.phase === 'river') solve(tableId); else nextStage(tableId);
     } else {
-        rotateTurn(tableId);
+        do { t.turnIndex = (t.turnIndex + 1) % t.players.length; } while (t.players[t.turnIndex].folded);
         broadcast(tableId);
-        startTimer(tableId);
     }
 };
 
-const endHandImmediate = async (tableId, winner) => {
-    const table = tables[tableId];
-    clearInterval(table.turnTimeout);
-    table.phase = 'showdown';
-    table.winners = [winner.name];
-    
-    // Award Pot
-    const player = table.players.find(p => p.id === winner.id);
-    player.balance += table.pot;
-    await User.findByIdAndUpdate(player.dbId, { $inc: { balance: table.pot } });
-    
-    broadcast(tableId);
-    setTimeout(() => startNewHand(tableId), 4000);
+const nextStage = (id) => {
+    const t = tables[id];
+    t.highestBet = 0; t.players.forEach(pl => { pl.bet = 0; pl.acted = false; });
+    if (t.phase === 'preflop') t.communityCards.push(t.deck.pop(), t.deck.pop(), t.deck.pop());
+    else t.communityCards.push(t.deck.pop());
+    t.phase = t.phase === 'preflop' ? 'flop' : (t.phase === 'flop' ? 'turn' : 'river');
+    t.turnIndex = 0; broadcast(id);
 };
 
-const solveHand = async (tableId) => {
-    const table = tables[tableId];
-    table.phase = 'showdown';
-    try {
-        const playersForSolver = table.players.filter(p => !p.folded).map(p => {
-            const sevenCards = [...p.hand, ...table.communityCards].map(c => c.replace('0', 'T'));
-            const hand = Hand.solve(sevenCards);
-            hand.ownerId = p.dbId;
-            hand.originalName = p.name;
-            return hand;
-        });
-        const winners = Hand.winners(playersForSolver);
-        const payout = Math.floor(table.pot / winners.length);
-        table.winners = winners.map(w => w.originalName);
-
-        for (let w of winners) {
-            const player = table.players.find(p => p.dbId === w.ownerId);
-            if(player) player.balance += payout;
-            await User.findByIdAndUpdate(w.ownerId, { $inc: { balance: payout } });
-        }
-    } catch(e) { console.log("Solver Error", e); }
-    
-    broadcast(tableId);
-    setTimeout(() => startNewHand(tableId), 8000);
-};
-
-const startNewHand = (tableId) => {
-    const table = tables[tableId];
-    const activePlayers = table.players.filter(p => p.balance > 0);
-    
-    if (activePlayers.length < 2) { 
-        table.phase = 'waiting'; table.communityCards = []; table.pot = 0; table.winners = [];
-        broadcast(tableId); return; 
-    }
-
-    table.deck = createDeck();
-    table.communityCards = [];
-    table.pot = 0;
-    table.phase = 'preflop';
-    table.winners = [];
-    
-    // Move Dealer
-    table.dealerIndex = (table.dealerIndex + 1) % table.players.length;
-    
-    // Blinds
-    const sb = (table.dealerIndex + 1) % table.players.length;
-    const bb = (table.dealerIndex + 2) % table.players.length;
-
-    table.players.forEach((p, i) => {
-        p.hand = [table.deck.pop(), table.deck.pop()];
-        p.folded = false;
-        p.actedThisRound = false;
-        p.currentBet = 0;
-        
-        if (i === sb) { 
-            const amt = Math.min(p.balance, table.smallBlind);
-            p.balance -= amt; p.currentBet = amt; table.pot += amt; 
-        }
-        if (i === bb) { 
-            const amt = Math.min(p.balance, table.bigBlind);
-            p.balance -= amt; p.currentBet = amt; table.pot += amt; table.highestBet = amt; 
-        }
+const solve = (id) => {
+    const t = tables[id]; t.phase = 'showdown';
+    const hands = t.players.filter(pl => !pl.folded).map(pl => {
+        const s = Hand.solve([...pl.hand, ...t.communityCards].map(c => c.replace('0','T')));
+        s.name = pl.name; s.dbId = pl.dbId; return s;
     });
-
-    table.turnIndex = (bb + 1) % table.players.length;
-    broadcast(tableId);
-    startTimer(tableId);
+    const winners = Hand.winners(hands);
+    t.winners = winners.map(w => w.name);
+    const payout = t.pot / winners.length;
+    winners.forEach(w => {
+        const pl = t.players.find(p => p.dbId === w.dbId);
+        pl.balance += payout;
+        User.findByIdAndUpdate(w.dbId, { $inc: { balance: payout } }).exec();
+    });
+    broadcast(id); setTimeout(() => startNewHand(id), 8000);
 };
 
-io.on('connection', (socket) => {
-    socket.on('getTables', () => {
-        socket.emit('tableList', Object.values(tables).map(t => ({ id: t.id, name: t.name, players: t.players.length })));
-    });
-
-    socket.on('joinTable', async ({ tableId, userId, buyIn }) => {
-        const table = tables[tableId];
+io.on('connection', (s) => {
+    s.on('joinTable', async ({ tableId, userId, buyIn }) => {
         const user = await User.findById(userId);
-        if (!table || !user) return;
-        socket.join(tableId);
-
-        const existing = table.players.find(p => p.dbId === userId);
-        if (existing) { existing.id = socket.id; broadcast(tableId); return; }
-
-        if (user.balance < buyIn) return;
-        await User.findByIdAndUpdate(userId, { $inc: { balance: -buyIn } });
-        table.players.push({ id: socket.id, dbId: userId, name: user.username, balance: buyIn, hand: [], currentBet: 0, folded: false, actedThisRound: false });
-
-        if (table.players.length >= 2 && table.phase === 'waiting') startNewHand(tableId);
+        if (!user) return;
+        s.join(tableId);
+        tables[tableId].players.push({ id: s.id, dbId: userId, name: user.username, balance: buyIn, hand: [], bet: 0, folded: false, acted: false });
+        if (tables[tableId].players.length >= 2 && tables[tableId].phase === 'waiting') startNewHand(tableId);
         else broadcast(tableId);
     });
-
-    socket.on('leaveTable', async ({ tableId }) => {
-        const table = tables[tableId];
-        if(!table) return;
-        const idx = table.players.findIndex(p => p.id === socket.id);
-        if (idx !== -1) {
-            const p = table.players[idx];
-            await User.findByIdAndUpdate(p.dbId, { $inc: { balance: p.balance } });
-            table.players.splice(idx, 1);
-            socket.leave(tableId);
-            if(table.players.length < 2) { table.phase = 'waiting'; clearInterval(table.turnTimeout); }
-            broadcast(tableId);
-        }
-    });
-
-    socket.on('action', ({ tableId, type, amount }) => handleAction(tableId, socket.id, type, amount));
+    s.on('action', (d) => handleAction(d.tableId, s.id, d.type, d.amount));
 });
 
 server.listen(process.env.PORT || 10000);
