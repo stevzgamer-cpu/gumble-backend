@@ -159,4 +159,52 @@ app.post('/api/dragon/cashout', async (req, res) => {
     res.json({ status: 'cashed_out', win });
 });
 
+// --- MINES LOGIC (Cashout) ---
+app.post('/api/mines/start', async (req, res) => {
+    const { userId, bet, mines } = req.body;
+    const user = await User.findById(userId);
+    if(user.balance < bet) return res.status(400).json({error: "Funds"});
+    user.balance -= bet; await user.save();
+
+    let grid = Array(25).fill('gem');
+    for(let i=0; i<mines; i++) grid[i] = 'bomb';
+    grid = grid.sort(()=>Math.random()-.5);
+
+    games[userId] = { 
+        type: 'mines', bet, mines, grid, 
+        revealed: Array(25).fill(false), 
+        status: 'playing', multiplier: 1.0
+    };
+    res.json({ status: 'playing', revealed: Array(25).fill(false), multiplier: 1.0 });
+});
+
+app.post('/api/mines/click', async (req, res) => {
+    const { userId, tile } = req.body;
+    const g = games[userId];
+    if(!g || g.type !== 'mines') return res.status(400);
+
+    if(g.grid[tile] === 'bomb') {
+        g.status = 'boom'; g.revealed[tile] = true;
+        delete games[userId];
+        res.json({ status: 'boom', grid: g.grid });
+    } else {
+        g.revealed[tile] = true;
+        const found = g.revealed.filter(Boolean).length;
+        // Simple multiplier increment
+        g.multiplier = g.multiplier * 1.15; 
+        res.json({ status: 'playing', revealed: g.revealed, multiplier: g.multiplier });
+    }
+});
+
+app.post('/api/mines/cashout', async (req, res) => {
+    const { userId } = req.body;
+    const g = games[userId];
+    if(!g) return res.status(400);
+    const win = g.bet * g.multiplier;
+    const user = await User.findById(userId);
+    user.balance += win; await user.save();
+    delete games[userId];
+    res.json({ status: 'cashed_out', win });
+});
+
 app.listen(process.env.PORT || 10000);
