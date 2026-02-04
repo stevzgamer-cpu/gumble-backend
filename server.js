@@ -50,7 +50,7 @@ const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: "*" } });
 const tables = {}; 
 
-['Casual', 'High Rollers'].forEach((name, i) => {
+['Casual', 'High Rollers', 'Pro'].forEach((name, i) => {
     const id = `t${i+1}`;
     tables[id] = {
         id, name, smallBlind: (i+1)*10, bigBlind: (i+1)*20,
@@ -75,8 +75,8 @@ const broadcastTable = (tableId) => {
 const nextStage = (tableId) => {
     const table = tables[tableId];
     clearInterval(table.turnTimeout);
-    table.players.forEach(p => { p.currentBet = 0; });
-    table.highestBet = 0;
+    table.players.forEach(p => { p.actedThisRound = false; }); // Reset for new round
+    table.highestBet = 0; // Reset bet for new round
 
     if (table.phase === 'preflop') {
         table.phase = 'flop';
@@ -93,8 +93,9 @@ const nextStage = (tableId) => {
     
     // Start betting left of dealer
     table.turnIndex = (table.dealerIndex + 1) % table.players.length;
-    // Ensure we start on an active player
-    if(table.players[table.turnIndex].folded) rotateTurn(tableId);
+    while(table.players[table.turnIndex].folded) {
+        table.turnIndex = (table.turnIndex + 1) % table.players.length;
+    }
     
     broadcastTable(tableId);
     startTurnTimer(tableId);
@@ -112,6 +113,11 @@ const rotateTurn = (tableId) => {
 const startTurnTimer = (tableId) => {
     const table = tables[tableId];
     clearInterval(table.turnTimeout);
+    
+    // Safety: Don't start timer if only 1 player
+    const active = table.players.filter(p => !p.folded);
+    if (active.length < 2) return; 
+
     table.timer = 30;
     table.turnTimeout = setInterval(() => {
         table.timer--;
@@ -129,36 +135,73 @@ const handleAction = (tableId, socketId, type, amount) => {
     if(!table) return;
     
     const player = table.players.find(p => p.id === socketId);
-    // STRICT VALIDATION: Is it your turn?
     if (!player || table.players[table.turnIndex].id !== socketId) return;
 
-    if (type === 'fold') player.folded = true;
-    else if (type === 'call') {
+    player.actedThisRound = true; // Mark that they played
+
+    if (type === 'fold') {
+        player.folded = true;
+        // Check Immediate Win
+        const active = table.players.filter(p => !p.folded);
+        if (active.length === 1) {
+            endHandImmediate(tableId, active[0]);
+            return;
+        }
+    } 
+    else if (type === 'call' || type === 'check') {
         const toCall = table.highestBet - player.currentBet;
-        player.balance -= toCall;
-        player.currentBet += toCall;
-        table.pot += toCall;
-    } else if (type === 'raise') {
+        if (player.balance >= toCall) {
+            player.balance -= toCall;
+            player.currentBet += toCall;
+            table.pot += toCall;
+        } else {
+            // All-in (Simplified)
+            player.currentBet += player.balance;
+            table.pot += player.balance;
+            player.balance = 0;
+        }
+    } 
+    else if (type === 'raise') {
         const total = Number(amount);
         const diff = total - player.currentBet;
-        player.balance -= diff;
-        player.currentBet = total;
-        table.pot += diff;
-        table.highestBet = total;
+        if (player.balance >= diff) {
+            player.balance -= diff;
+            player.currentBet = total;
+            table.pot += diff;
+            table.highestBet = total;
+            // Reset others so they have to call
+            table.players.forEach(p => { if (p.id !== socketId) p.actedThisRound = false; });
+        }
     }
 
+    // Check Stage Completion
     const active = table.players.filter(p => !p.folded);
+    // Everyone must match highest bet AND have acted once
     const allMatched = active.every(p => p.currentBet === table.highestBet);
-    
-    // If everyone matched bets (and it's not just one person left), next stage
-    if (allMatched && active.length > 1 && (table.highestBet > 0 || type === 'check')) {
-         // Logic check: if everyone checked (bet=0) or called raise
-         nextStage(tableId);
+    const allActed = active.every(p => p.actedThisRound || p.balance === 0);
+
+    if (allMatched && allActed && active.length > 1) {
+        nextStage(tableId);
     } else {
         rotateTurn(tableId);
         broadcastTable(tableId);
         startTurnTimer(tableId);
     }
+};
+
+const endHandImmediate = async (tableId, winner) => {
+    const table = tables[tableId];
+    clearInterval(table.turnTimeout);
+    table.phase = 'showdown';
+    table.winners = [winner.name];
+    
+    // Award Pot
+    const player = table.players.find(p => p.id === winner.id);
+    player.balance += table.pot;
+    await User.findByIdAndUpdate(player.dbId, { $inc: { balance: table.pot } });
+    
+    broadcastTable(tableId);
+    setTimeout(() => startNewHand(tableId), 4000);
 };
 
 const solveHand = async (tableId) => {
@@ -198,21 +241,28 @@ const startNewHand = (tableId) => {
     table.winners = [];
     table.dealerIndex = (table.dealerIndex + 1) % table.players.length;
     
-    // Blinds Logic
+    // Blinds
     const sb = (table.dealerIndex + 1) % table.players.length;
     const bb = (table.dealerIndex + 2) % table.players.length;
 
     table.players.forEach((p, i) => {
         p.hand = [table.deck.pop(), table.deck.pop()];
         p.folded = false;
+        p.actedThisRound = false;
         p.currentBet = 0;
-        if (i === sb) { p.balance -= table.smallBlind; p.currentBet = table.smallBlind; table.pot += table.smallBlind; }
-        if (i === bb) { p.balance -= table.bigBlind; p.currentBet = table.bigBlind; table.pot += table.bigBlind; table.highestBet = table.bigBlind; }
+        
+        // Auto Blinds
+        if (i === sb) { 
+            const amt = Math.min(p.balance, table.smallBlind);
+            p.balance -= amt; p.currentBet = amt; table.pot += amt; 
+        }
+        if (i === bb) { 
+            const amt = Math.min(p.balance, table.bigBlind);
+            p.balance -= amt; p.currentBet = amt; table.pot += amt; table.highestBet = amt; 
+        }
     });
 
-    // Turn starts AFTER Big Blind
     table.turnIndex = (bb + 1) % table.players.length;
-    
     broadcastTable(tableId);
     startTurnTimer(tableId);
 };
@@ -229,13 +279,12 @@ io.on('connection', (socket) => {
         if (!table || !user) return;
         socket.join(tableId);
 
-        // RECONNECTION FIX
         const existing = table.players.find(p => p.dbId === userId);
         if (existing) { existing.id = socket.id; broadcastTable(tableId); return; }
 
         if (user.balance < buyIn) return;
         await User.findByIdAndUpdate(userId, { $inc: { balance: -buyIn } });
-        table.players.push({ id: socket.id, dbId: userId, name: user.username, balance: buyIn, hand: [], currentBet: 0, folded: false });
+        table.players.push({ id: socket.id, dbId: userId, name: user.username, balance: buyIn, hand: [], currentBet: 0, folded: false, actedThisRound: false });
 
         if (table.players.length >= 2 && table.phase === 'waiting') startNewHand(tableId);
         else broadcastTable(tableId);
