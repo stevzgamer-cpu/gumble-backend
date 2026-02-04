@@ -5,14 +5,14 @@ const mongoose = require('mongoose');
 const cors = require('cors');
 const { Server } = require('socket.io');
 const { Hand } = require('pokersolver'); 
-const { OAuth2Client } = require('google-auth-library'); // NEW LIBRARY
+const { OAuth2Client } = require('google-auth-library');
 const User = require('./models/User');
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-// CLIENT ID (Paste yours here or in .env)
+// --- REPLACE WITH YOUR ACTUAL CLIENT ID ---
 const GOOGLE_CLIENT_ID = "YOUR_GOOGLE_CLIENT_ID_HERE"; 
 const client = new OAuth2Client(GOOGLE_CLIENT_ID);
 
@@ -21,44 +21,19 @@ mongoose.connect(process.env.MONGO_URI)
   .catch(err => console.error("❌ DB Error:", err));
 
 // --- AUTH ROUTES ---
-
-// 1. Google Login Route
 app.post('/api/google-login', async (req, res) => {
     const { token } = req.body;
     try {
-        // Verify the token with Google
-        const ticket = await client.verifyIdToken({
-            idToken: token,
-            audience: GOOGLE_CLIENT_ID,
-        });
-        const { name, email, sub } = ticket.getPayload();
-
-        // Find or Create User
+        const ticket = await client.verifyIdToken({ idToken: token, audience: GOOGLE_CLIENT_ID });
+        const { name, email } = ticket.getPayload();
         let user = await User.findOne({ email });
         if (!user) {
-            // New Google User
-            user = await User.create({
-                username: name,
-                email: email,
-                balance: 10000, // Welcome Bonus
-                password: "" // No password for Google users
-            });
+            user = await User.create({ username: name, email, balance: 10000, password: "" });
         }
         res.json(user);
-    } catch (error) {
-        console.error("Google Auth Error:", error);
-        res.status(400).json({ error: "Google Login Failed" });
-    }
+    } catch (error) { res.status(400).json({ error: "Google Auth Failed" }); }
 });
 
-// 2. Standard Login
-app.post('/api/login', async (req, res) => {
-  const user = await User.findOne({ username: req.body.username, password: req.body.password });
-  if (user) res.json(user);
-  else res.status(400).json({ error: "Invalid credentials" });
-});
-
-// 3. Register
 app.post('/api/register', async (req, res) => {
   try {
     const user = await User.create({ username: req.body.username, password: req.body.password, balance: 10000 });
@@ -66,12 +41,16 @@ app.post('/api/register', async (req, res) => {
   } catch (err) { res.status(400).json({ error: "Username taken" }); }
 });
 
-// 4. Wallet
+app.post('/api/login', async (req, res) => {
+  const user = await User.findOne({ username: req.body.username, password: req.body.password });
+  if (user) res.json(user);
+  else res.status(400).json({ error: "Invalid credentials" });
+});
+
 app.post('/api/wallet', async (req, res) => {
     const { userId, amount, type } = req.body;
     const user = await User.findById(userId);
     if (!user) return res.status(404).json({ error: "User not found" });
-
     if (type === 'deposit') user.balance += Number(amount);
     if (type === 'withdraw') {
         if (user.balance < amount) return res.status(400).json({ error: "Insufficient funds" });
@@ -81,22 +60,23 @@ app.post('/api/wallet', async (req, res) => {
     res.json(user);
 });
 
-// --- POKER ENGINE (Multi-Table) ---
+// --- POKER ENGINE ---
 const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: "*" } });
 
 const tables = {}; 
 
-const createTable = (id, name, smallBlind, bigBlind) => ({
-    id, name, smallBlind, bigBlind,
-    players: [], communityCards: [], pot: 0, deck: [],
-    phase: 'waiting', turnIndex: 0, dealerIndex: 0, highestBet: 0, 
-    timer: 30, winners: [], turnTimeout: null
+// Initialize Tables
+['Casual', 'High Rollers', 'Heads Up'].forEach((name, i) => {
+    const id = `t${i+1}`;
+    tables[id] = {
+        id, name, 
+        smallBlind: (i+1)*10, bigBlind: (i+1)*20,
+        players: [], communityCards: [], pot: 0, deck: [],
+        phase: 'waiting', turnIndex: 0, dealerIndex: 0, highestBet: 0, 
+        timer: 30, winners: [], turnTimeout: null
+    };
 });
-
-tables['t1'] = createTable('t1', 'Casual ($10/$20)', 10, 20);
-tables['t2'] = createTable('t2', 'High Rollers ($50/$100)', 50, 100);
-tables['t3'] = createTable('t3', 'Heads Up ($100/$200)', 100, 200);
 
 const createDeck = () => {
   const suits = ['h', 'd', 'c', 's'];
@@ -107,7 +87,7 @@ const createDeck = () => {
 };
 
 const broadcastTable = (tableId) => {
-    io.to(tableId).emit('gameState', { ...tables[tableId], turnTimeout: null });
+    if(tables[tableId]) io.to(tableId).emit('gameState', { ...tables[tableId], turnTimeout: null });
 };
 
 const nextStage = (tableId) => {
@@ -163,6 +143,8 @@ const handleAction = (tableId, socketId, type, amount) => {
     const table = tables[tableId];
     if(!table) return;
     const player = table.players.find(p => p.id === socketId);
+    
+    // Strict Turn Check
     if (!player || table.players[table.turnIndex].id !== socketId) return;
 
     if (type === 'fold') player.folded = true;
@@ -183,7 +165,8 @@ const handleAction = (tableId, socketId, type, amount) => {
     const active = table.players.filter(p => !p.folded);
     const allMatched = active.every(p => p.currentBet === table.highestBet);
     
-    if (allMatched && active.length > 1) nextStage(tableId);
+    if (allMatched && active.length > 1 && table.highestBet > 0) nextStage(tableId); 
+    else if (allMatched && table.highestBet === 0 && active.length === table.players.length) nextStage(tableId); // Check around
     else {
         rotateTurn(tableId);
         broadcastTable(tableId);
@@ -247,17 +230,33 @@ io.on('connection', (socket) => {
         const list = Object.values(tables).map(t => ({ id: t.id, name: t.name, players: t.players.length, sb: t.smallBlind, bb: t.bigBlind }));
         socket.emit('tableList', list);
     });
+
     socket.on('joinTable', async ({ tableId, userId, buyIn }) => {
         const table = tables[tableId];
         const user = await User.findById(userId);
-        if (!table || !user || user.balance < buyIn) return;
-        socket.leave(tableId); 
-        await User.findByIdAndUpdate(userId, { $inc: { balance: -buyIn } });
+        if (!table || !user) return;
+
         socket.join(tableId);
+
+        // --- RECONNECTION LOGIC ---
+        const existingPlayer = table.players.find(p => p.dbId === userId);
+        if (existingPlayer) {
+            // Player is already at table -> Reconnect them!
+            existingPlayer.id = socket.id; // Update Socket ID
+            broadcastTable(tableId); // Send them the current state (with their cards)
+            return;
+        }
+
+        // Only add new player if they have money
+        if (user.balance < buyIn) return;
+        await User.findByIdAndUpdate(userId, { $inc: { balance: -buyIn } });
+        
         table.players.push({ id: socket.id, dbId: userId, name: user.username, balance: buyIn, hand: [], currentBet: 0, folded: false });
+
         if (table.players.length >= 2 && table.phase === 'waiting') startNewHand(tableId);
         else broadcastTable(tableId);
     });
+
     socket.on('leaveTable', async ({ tableId }) => {
         const table = tables[tableId];
         if(!table) return;
