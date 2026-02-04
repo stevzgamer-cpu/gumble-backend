@@ -12,24 +12,22 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// --- REPLACE WITH YOUR ACTUAL CLIENT ID ---
-const GOOGLE_CLIENT_ID = "YOUR_GOOGLE_CLIENT_ID_HERE"; 
+// --- ⚠️ PASTE YOUR GOOGLE CLIENT ID HERE ---
+const GOOGLE_CLIENT_ID = "67123336647-b00rcsb6ni8s8unhi3qqg0bk6l2es62l.apps.googleusercontent.com"; 
 const client = new OAuth2Client(GOOGLE_CLIENT_ID);
 
 mongoose.connect(process.env.MONGO_URI)
   .then(() => console.log("✅ MongoDB Connected"))
   .catch(err => console.error("❌ DB Error:", err));
 
-// --- AUTH ROUTES ---
+// --- AUTH ---
 app.post('/api/google-login', async (req, res) => {
     const { token } = req.body;
     try {
         const ticket = await client.verifyIdToken({ idToken: token, audience: GOOGLE_CLIENT_ID });
         const { name, email } = ticket.getPayload();
         let user = await User.findOne({ email });
-        if (!user) {
-            user = await User.create({ username: name, email, balance: 10000, password: "" });
-        }
+        if (!user) user = await User.create({ username: name, email, balance: 10000, password: "" });
         res.json(user);
     } catch (error) { res.status(400).json({ error: "Google Auth Failed" }); }
 });
@@ -47,31 +45,15 @@ app.post('/api/login', async (req, res) => {
   else res.status(400).json({ error: "Invalid credentials" });
 });
 
-app.post('/api/wallet', async (req, res) => {
-    const { userId, amount, type } = req.body;
-    const user = await User.findById(userId);
-    if (!user) return res.status(404).json({ error: "User not found" });
-    if (type === 'deposit') user.balance += Number(amount);
-    if (type === 'withdraw') {
-        if (user.balance < amount) return res.status(400).json({ error: "Insufficient funds" });
-        user.balance -= Number(amount);
-    }
-    await user.save();
-    res.json(user);
-});
-
-// --- POKER ENGINE ---
+// --- ENGINE ---
 const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: "*" } });
-
 const tables = {}; 
 
-// Initialize Tables
-['Casual', 'High Rollers', 'Heads Up'].forEach((name, i) => {
+['Casual', 'High Rollers'].forEach((name, i) => {
     const id = `t${i+1}`;
     tables[id] = {
-        id, name, 
-        smallBlind: (i+1)*10, bigBlind: (i+1)*20,
+        id, name, smallBlind: (i+1)*10, bigBlind: (i+1)*20,
         players: [], communityCards: [], pot: 0, deck: [],
         phase: 'waiting', turnIndex: 0, dealerIndex: 0, highestBet: 0, 
         timer: 30, winners: [], turnTimeout: null
@@ -109,8 +91,11 @@ const nextStage = (tableId) => {
         solveHand(tableId); return;
     }
     
-    table.turnIndex = table.dealerIndex;
-    rotateTurn(tableId);
+    // Start betting left of dealer
+    table.turnIndex = (table.dealerIndex + 1) % table.players.length;
+    // Ensure we start on an active player
+    if(table.players[table.turnIndex].folded) rotateTurn(tableId);
+    
     broadcastTable(tableId);
     startTurnTimer(tableId);
 };
@@ -142,9 +127,9 @@ const startTurnTimer = (tableId) => {
 const handleAction = (tableId, socketId, type, amount) => {
     const table = tables[tableId];
     if(!table) return;
-    const player = table.players.find(p => p.id === socketId);
     
-    // Strict Turn Check
+    const player = table.players.find(p => p.id === socketId);
+    // STRICT VALIDATION: Is it your turn?
     if (!player || table.players[table.turnIndex].id !== socketId) return;
 
     if (type === 'fold') player.folded = true;
@@ -165,9 +150,11 @@ const handleAction = (tableId, socketId, type, amount) => {
     const active = table.players.filter(p => !p.folded);
     const allMatched = active.every(p => p.currentBet === table.highestBet);
     
-    if (allMatched && active.length > 1 && table.highestBet > 0) nextStage(tableId); 
-    else if (allMatched && table.highestBet === 0 && active.length === table.players.length) nextStage(tableId); // Check around
-    else {
+    // If everyone matched bets (and it's not just one person left), next stage
+    if (allMatched && active.length > 1 && (table.highestBet > 0 || type === 'check')) {
+         // Logic check: if everyone checked (bet=0) or called raise
+         nextStage(tableId);
+    } else {
         rotateTurn(tableId);
         broadcastTable(tableId);
         startTurnTimer(tableId);
@@ -210,6 +197,8 @@ const startNewHand = (tableId) => {
     table.phase = 'preflop';
     table.winners = [];
     table.dealerIndex = (table.dealerIndex + 1) % table.players.length;
+    
+    // Blinds Logic
     const sb = (table.dealerIndex + 1) % table.players.length;
     const bb = (table.dealerIndex + 2) % table.players.length;
 
@@ -220,14 +209,17 @@ const startNewHand = (tableId) => {
         if (i === sb) { p.balance -= table.smallBlind; p.currentBet = table.smallBlind; table.pot += table.smallBlind; }
         if (i === bb) { p.balance -= table.bigBlind; p.currentBet = table.bigBlind; table.pot += table.bigBlind; table.highestBet = table.bigBlind; }
     });
+
+    // Turn starts AFTER Big Blind
     table.turnIndex = (bb + 1) % table.players.length;
+    
     broadcastTable(tableId);
     startTurnTimer(tableId);
 };
 
 io.on('connection', (socket) => {
     socket.on('getTables', () => {
-        const list = Object.values(tables).map(t => ({ id: t.id, name: t.name, players: t.players.length, sb: t.smallBlind, bb: t.bigBlind }));
+        const list = Object.values(tables).map(t => ({ id: t.id, name: t.name, players: t.players.length }));
         socket.emit('tableList', list);
     });
 
@@ -235,41 +227,20 @@ io.on('connection', (socket) => {
         const table = tables[tableId];
         const user = await User.findById(userId);
         if (!table || !user) return;
-
         socket.join(tableId);
 
-        // --- RECONNECTION LOGIC ---
-        const existingPlayer = table.players.find(p => p.dbId === userId);
-        if (existingPlayer) {
-            // Player is already at table -> Reconnect them!
-            existingPlayer.id = socket.id; // Update Socket ID
-            broadcastTable(tableId); // Send them the current state (with their cards)
-            return;
-        }
+        // RECONNECTION FIX
+        const existing = table.players.find(p => p.dbId === userId);
+        if (existing) { existing.id = socket.id; broadcastTable(tableId); return; }
 
-        // Only add new player if they have money
         if (user.balance < buyIn) return;
         await User.findByIdAndUpdate(userId, { $inc: { balance: -buyIn } });
-        
         table.players.push({ id: socket.id, dbId: userId, name: user.username, balance: buyIn, hand: [], currentBet: 0, folded: false });
 
         if (table.players.length >= 2 && table.phase === 'waiting') startNewHand(tableId);
         else broadcastTable(tableId);
     });
-
-    socket.on('leaveTable', async ({ tableId }) => {
-        const table = tables[tableId];
-        if(!table) return;
-        const idx = table.players.findIndex(p => p.id === socket.id);
-        if (idx !== -1) {
-            const p = table.players[idx];
-            await User.findByIdAndUpdate(p.dbId, { $inc: { balance: p.balance } });
-            table.players.splice(idx, 1);
-            socket.leave(tableId);
-            if(table.players.length < 2) { table.phase = 'waiting'; clearInterval(table.turnTimeout); }
-            broadcastTable(tableId);
-        }
-    });
+    
     socket.on('action', ({ tableId, type, amount }) => handleAction(tableId, socket.id, type, amount));
 });
 
